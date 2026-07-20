@@ -386,10 +386,14 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
         if config.inference
         else {}
     )
+    slurm_template_vars = {
+        **config.slurm.template_vars,
+        "prime_rl_uv_sync_args": os.environ.get("PRIME_RL_UV_SYNC_ARGS", ""),
+    }
 
     if config.deployment.type == "single_node":
         script = template.render(
-            **config.slurm.template_vars,
+            **slurm_template_vars,
             config_path=config_dir / RL_TOML,
             output_dir=config.output_dir,
             gpus_per_node=config.deployment.gpus_per_node,
@@ -398,7 +402,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
         infer_deploy = config.inference.deployment
 
         script = template.render(
-            **config.slurm.template_vars,
+            **slurm_template_vars,
             is_disaggregated=True,
             config_dir=config_dir,
             output_dir=config.output_dir,
@@ -435,7 +439,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
         )
     else:
         script = template.render(
-            **config.slurm.template_vars,
+            **slurm_template_vars,
             is_disaggregated=False,
             config_dir=config_dir,  # TODO: should prob have each subconfig path separately
             output_dir=config.output_dir,

@@ -47,17 +47,21 @@ def write_slurm_script(config: SFTConfig, config_path: Path, script_path: Path) 
         **DEFAULT_TRAINER_ENV_VARS,
         **config.env_vars,
     }
+    slurm_template_vars = {
+        **config.slurm.template_vars,
+        "prime_rl_uv_sync_args": os.environ.get("PRIME_RL_UV_SYNC_ARGS", ""),
+    }
 
     if config.deployment.type == "single_node":
         script = template.render(
-            **config.slurm.template_vars,
+            **slurm_template_vars,
             config_path=config_path,
             output_dir=config.output_dir,
             gpus_per_node=config.deployment.gpus_per_node,
         )
     else:
         script = template.render(
-            **config.slurm.template_vars,
+            **slurm_template_vars,
             config_path=config_path,
             output_dir=config.output_dir,
             trainer_env_vars=trainer_env_vars,

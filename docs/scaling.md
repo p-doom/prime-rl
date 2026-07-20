@@ -183,11 +183,14 @@ The `rl`, `sft`, and `inference` entrypoints all submit to SLURM when a `[slurm]
 
 > **The prime-rl checkout and its `uv` venv must live on a shared filesystem** visible to every node. The generated sbatch script runs a single `uv sync --all-extras --all-packages` on the batch node (not once per node), so all ranks share that one environment — a node-local venv would leave the other nodes stale.
 
-For site-specific installer workarounds, set `PRIME_RL_UV_SYNC_ARGS` to the
-additional trusted arguments that the generated sbatch script should append to
-`uv sync`. For example, `PRIME_RL_UV_SYNC_ARGS="--no-install-package example"`
-omits a package whose binary is unavailable on the cluster. Excluded packages
-must not be used by the selected training configuration.
+For site-specific installer workarounds, set `PRIME_RL_UV_SYNC_ARGS` to simple,
+whitespace-separated trusted arguments that the generated sbatch script should
+append to `uv sync`. The launcher embeds the value in the generated script, so
+manual submission after `--dry-run` behaves identically. For example,
+`PRIME_RL_UV_SYNC_ARGS="--no-install-package example"` omits a package whose
+binary is unavailable on the cluster. Excluded packages must not be used by the
+selected training configuration. Arguments containing quoted whitespace are
+not supported.
 
 ### Activation
 

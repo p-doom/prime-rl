@@ -69,6 +69,7 @@ def write_slurm_script(config: InferenceConfig, config_path: Path, script_path: 
         kv_offload_device_name=offload.device_name if is_mooncake else "",
         inference_env_vars={**DEFAULT_COMMON_ENV_VARS, **DEFAULT_INFERENCE_ENV_VARS, **config.env_vars},
     )
+    template_vars["prime_rl_uv_sync_args"] = os.environ.get("PRIME_RL_UV_SYNC_ARGS", "")
 
     is_multi_node = config.deployment.type == "multi_node"
 

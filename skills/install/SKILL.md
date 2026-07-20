@@ -29,6 +29,11 @@ uv sync --all-extras --all-packages        # + all env packages (needed to train
 uv sync --package prime-rl --package gsm8k-v1  # core + just one env
 ```
 
+Generated Slurm scripts also run `uv sync`. For site-specific installer
+workarounds, set `PRIME_RL_UV_SYNC_ARGS` before invoking the launcher. The
+launcher embeds its simple, whitespace-separated trusted arguments into the
+generated script, including scripts produced by `--dry-run`.
+
 Environment packages under `deps/research-environments/environments/*/*` and `deps/verifiers/environments/*` are uv **workspace members**, auto-discovered — adding a new env needs no `pyproject.toml` change. They are opt-in: a plain `uv sync` / `--all-extras` does not install them (and would remove them if already present — re-run with `--all-packages`, or `--inexact` to keep them). Install all with `--all-packages`, or a subset with repeated `--package <env>` (include `--package prime-rl` to keep the core). If two envs pin conflicting transitive versions (all members share one lock), add the loser to `[tool.uv.workspace].exclude`.
 
 When bumping a package past the workspace-wide `exclude-newer = "7 days"` window, add it (and any newly-required transitives) to `[tool.uv.exclude-newer-package]` before refreshing `uv.lock`.
