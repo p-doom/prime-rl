@@ -35,6 +35,7 @@ from prime_rl.utils.process import (
     monitor_process,
     set_proc_title,
 )
+from prime_rl.utils.uv import shell_quote, uv_sync_args_from_env
 
 RL_TOML = "rl.toml"
 RL_SBATCH = "rl.sbatch"
@@ -360,6 +361,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
     assert config.slurm.template_path is not None
 
     env = Environment(loader=FileSystemLoader(config.slurm.template_path.parent), keep_trailing_newline=True)
+    env.filters["shell_quote"] = shell_quote
     template = env.get_template(config.slurm.template_path.name)
 
     offload = config.inference.kv_cache_offload if config.inference is not None else None
@@ -388,7 +390,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
     )
     slurm_template_vars = {
         **config.slurm.template_vars,
-        "prime_rl_uv_sync_args": os.environ.get("PRIME_RL_UV_SYNC_ARGS", ""),
+        "prime_rl_uv_sync_args": uv_sync_args_from_env(),
     }
 
     if config.deployment.type == "single_node":

@@ -31,7 +31,7 @@ export PROJECT_DIR={{ project_dir }}
 cd $PROJECT_DIR
 [ -f .env ] && source .env
 source .venv/bin/activate
-uv sync --all-extras --all-packages {{ prime_rl_uv_sync_args }}
+uv sync --all-extras --all-packages{% for arg in prime_rl_uv_sync_args %} {{ arg | shell_quote }}{% endfor %}
 
 {% if pre_run_command %}
 # Pre-run command

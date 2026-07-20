@@ -12,6 +12,7 @@ from prime_rl.utils.config import cli, to_toml_dict
 from prime_rl.utils.logger import setup_logger
 from prime_rl.utils.pathing import format_log_message, get_config_dir, get_log_dir
 from prime_rl.utils.process import DEFAULT_COMMON_ENV_VARS, DEFAULT_INFERENCE_ENV_VARS, set_proc_title
+from prime_rl.utils.uv import shell_quote, uv_sync_args_from_env
 
 INFERENCE_TOML = "inference.toml"
 INFERENCE_SBATCH = "inference.sbatch"
@@ -45,6 +46,7 @@ def write_slurm_script(config: InferenceConfig, config_path: Path, script_path: 
     assert config.slurm.template_path is not None
 
     env = Environment(loader=FileSystemLoader(config.slurm.template_path.parent), keep_trailing_newline=True)
+    env.filters["shell_quote"] = shell_quote
     template = env.get_template(config.slurm.template_path.name)
 
     is_disaggregated = config.deployment.type == "disaggregated"
@@ -69,7 +71,7 @@ def write_slurm_script(config: InferenceConfig, config_path: Path, script_path: 
         kv_offload_device_name=offload.device_name if is_mooncake else "",
         inference_env_vars={**DEFAULT_COMMON_ENV_VARS, **DEFAULT_INFERENCE_ENV_VARS, **config.env_vars},
     )
-    template_vars["prime_rl_uv_sync_args"] = os.environ.get("PRIME_RL_UV_SYNC_ARGS", "")
+    template_vars["prime_rl_uv_sync_args"] = uv_sync_args_from_env()
 
     is_multi_node = config.deployment.type == "multi_node"
 
