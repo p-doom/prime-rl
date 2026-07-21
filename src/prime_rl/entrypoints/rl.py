@@ -6,6 +6,8 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable, Mapping
+from ipaddress import ip_address
 from pathlib import Path
 from subprocess import Popen
 from threading import Event, Thread
@@ -45,8 +47,6 @@ TRAINER_TOML = "trainer.toml"
 ORCHESTRATOR_TOML = "orchestrator.toml"
 INFERENCE_TOML = "inference.toml"
 
-LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-
 
 def get_physical_gpu_ids() -> list[int]:
     """Return physical GPU IDs visible to the launcher."""
@@ -81,10 +81,71 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
             tomli_w.dump(to_toml_dict(config.inference, exclude=exclude_inference), f)
 
 
-def _replace_loopback_host(url: str, advertised_host: str) -> str:
-    """Replace a loopback URL host while preserving all other URL components."""
+def _normalized_host(host: str) -> str:
+    """Normalize a hostname or IP literal for classification."""
+    return host.strip().removeprefix("[").removesuffix("]").rstrip(".").casefold()
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = _normalized_host(host)
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_unspecified_host(host: str) -> bool:
+    try:
+        return ip_address(_normalized_host(host)).is_unspecified
+    except ValueError:
+        return False
+
+
+def _validate_advertised_host(host: str) -> str:
+    normalized = _normalized_host(host)
+    if not normalized or any(char in normalized for char in "/?#@") or any(char.isspace() for char in normalized):
+        raise ValueError(f"Invalid inference advertise host: {host!r}")
+    if ":" in normalized:
+        try:
+            ip_address(normalized)
+        except ValueError as exc:
+            raise ValueError(f"Inference advertise host must not include a scheme or port: {host!r}") from exc
+    if _is_loopback_host(normalized) or _is_unspecified_host(normalized):
+        raise ValueError(f"Inference advertise host is not remotely reachable: {host!r}")
+    return normalized
+
+
+def resolve_inference_advertise_host(
+    bind_host: str | None,
+    advertise_host: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+    hostname_func: Callable[[], str] | None = None,
+) -> str:
+    """Resolve an explicit or automatic host without performing network I/O."""
+    effective_bind_host = bind_host or "0.0.0.0"
+    if _is_loopback_host(effective_bind_host):
+        raise ValueError(f"Inference cannot be advertised while server.host is loopback-only: {effective_bind_host!r}")
+
+    if advertise_host != "auto":
+        return _validate_advertised_host(advertise_host)
+    if not _is_unspecified_host(effective_bind_host):
+        return _validate_advertised_host(effective_bind_host)
+
+    environment = os.environ if environ is None else environ
+    allocated_host = environment.get("SLURMD_NODENAME")
+    if not allocated_host:
+        get_hostname = socket.gethostname if hostname_func is None else hostname_func
+        allocated_host = get_hostname()
+    return _validate_advertised_host(allocated_host)
+
+
+def _replace_local_url_host(url: str, advertised_host: str) -> str:
+    """Replace a local-only URL host while preserving all other components."""
     parsed = urlsplit(url)
-    if parsed.hostname not in LOOPBACK_HOSTS:
+    if parsed.hostname is None or not (_is_loopback_host(parsed.hostname) or _is_unspecified_host(parsed.hostname)):
         return url
 
     host = f"[{advertised_host}]" if ":" in advertised_host else advertised_host
@@ -98,29 +159,23 @@ def _replace_loopback_host(url: str, advertised_host: str) -> str:
     return urlunsplit(parsed._replace(netloc=f"{userinfo}{host}{port}"))
 
 
-def advertise_inference_to_external_envs(config: RLConfig, advertised_host: str | None = None) -> bool:
-    """Expose launcher-managed inference to external v1 environment servers.
+def configure_inference_advertisement(config: RLConfig) -> bool:
+    """Apply an explicitly configured host to local model-client URLs.
 
-    V1 environment workers execute the serialized model client themselves. A
-    loopback URL therefore resolves on the environment node, not on the node
-    where this launcher starts inference. Keep loopback URLs for colocated
-    administrative traffic and advertise this node for rollout traffic.
+    Keep the original URLs for colocated administrative traffic. This runs
+    before the launcher serializes the orchestrator configuration, when an
+    allocated Slurm node is available to resolve ``advertise_host = "auto"``.
 
     Returns whether the model client was changed.
     """
-    if config.inference is None:
-        return False
-
-    envs = list(config.orchestrator.train.env)
-    if config.orchestrator.eval is not None:
-        envs.extend(config.orchestrator.eval.env)
-    if not any(env.address is not None for env in envs):
+    inference = config.inference
+    if inference is None or inference.server.advertise_host is None:
         return False
 
     client = config.orchestrator.model.client
     original_urls = list(client.base_url)
-    host = advertised_host or socket.gethostname()
-    advertised_urls = [_replace_loopback_host(url, host) for url in original_urls]
+    advertised_host = resolve_inference_advertise_host(inference.server.host, inference.server.advertise_host)
+    advertised_urls = [_replace_local_url_host(url, advertised_host) for url in original_urls]
     if advertised_urls == original_urls:
         return False
 
@@ -138,10 +193,8 @@ def rl_local(config: RLConfig):
         json_logging=config.log.json_logging,
     )
 
-    if advertise_inference_to_external_envs(config):
-        logger.info(
-            f"Advertising inference to external env servers at {', '.join(config.orchestrator.model.client.base_url)}"
-        )
+    if configure_inference_advertisement(config):
+        logger.info(f"Advertising inference at {', '.join(config.orchestrator.model.client.base_url)}")
 
     config_dir = config.output_dir / "configs"
     write_subconfigs(config, config_dir)
