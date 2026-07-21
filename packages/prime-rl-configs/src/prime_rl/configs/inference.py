@@ -19,12 +19,8 @@ class ServerConfig(BaseConfig):
     port: int = 8000
     """Port to bind to."""
 
-    advertise_host: Literal["auto"] | None = None
-    """Advertised host selection for remote model clients.
-
-    ``None`` preserves configured client URLs. ``"auto"`` uses a concrete
-    bind host or the allocated Slurm node for wildcard binds.
-    """
+    advertise: bool = False
+    """Advertise the host for remote model clients in single-node runs. If false, preserves model-client URLs."""
 
     liveness_timeout_seconds: float = Field(30.0, gt=0)
     """Timeout in seconds for the ``/liveness`` endpoint's internal vLLM worker RPC. With Kubernetes liveness probes, keep the probe ``timeoutSeconds`` at least this high."""

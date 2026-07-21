@@ -157,16 +157,9 @@ def _replace_local_url_host(url: str, advertised_host: str) -> str:
 
 
 def configure_inference_advertisement(config: RLConfig) -> bool:
-    """Apply an explicitly configured host to local model-client URLs.
-
-    Keep the original URLs for colocated administrative traffic. This runs
-    before the launcher serializes the orchestrator configuration, when an
-    allocated Slurm node is available to resolve ``advertise_host = "auto"``.
-
-    Returns whether the model client was changed.
-    """
+    """Apply an explicitly configured host to local model-client URLs."""
     inference = config.inference
-    if inference is None or inference.server.advertise_host is None:
+    if inference is None or not inference.server.advertise:
         return False
 
     client = config.orchestrator.model.client
