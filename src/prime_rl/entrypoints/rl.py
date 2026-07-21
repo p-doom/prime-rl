@@ -1,13 +1,16 @@
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
 import uuid
+from ipaddress import ip_address
 from pathlib import Path
 from subprocess import Popen
 from threading import Event, Thread
+from urllib.parse import urlsplit, urlunsplit
 
 import pynvml
 import tomli_w
@@ -78,6 +81,80 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
             tomli_w.dump(to_toml_dict(config.inference, exclude=exclude_inference), f)
 
 
+def normalize_host(host: str) -> str:
+    """Normalize a hostname or IP literal for classification."""
+    return host.strip().removeprefix("[").removesuffix("]").rstrip(".").casefold()
+
+
+def is_loopback_host(host: str) -> bool:
+    normalized = normalize_host(host)
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def is_unspecified_host(host: str) -> bool:
+    try:
+        return ip_address(normalize_host(host)).is_unspecified
+    except ValueError:
+        return False
+
+
+def resolve_inference_advertise_host(bind_host: str | None) -> str:
+    """Resolve the host advertised to remote model clients."""
+    bind_host = bind_host or "0.0.0.0"
+    if is_loopback_host(bind_host):
+        raise ValueError(f"Inference cannot be advertised while server.host is loopback-only: {bind_host!r}")
+
+    if not is_unspecified_host(bind_host):
+        return normalize_host(bind_host)
+
+    return os.environ.get("SLURMD_NODENAME") or socket.gethostname()
+
+
+def replace_local_url_host(url: str, advertised_host: str) -> str:
+    """Replace a local-only URL host while preserving all other components."""
+    parsed = urlsplit(url)
+    if parsed.hostname is None or not (is_loopback_host(parsed.hostname) or is_unspecified_host(parsed.hostname)):
+        return url
+
+    host = f"[{advertised_host}]" if ":" in advertised_host else advertised_host
+    userinfo = ""
+    if parsed.username is not None:
+        userinfo = parsed.username
+        if parsed.password is not None:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return urlunsplit(parsed._replace(netloc=f"{userinfo}{host}{port}"))
+
+
+def configure_inference_advertisement(config: RLConfig) -> bool:
+    """Advertise inference when ``server.advertise = true``.
+
+    Keep original URLs for colocated administrative traffic and replace
+    local-only rollout URLs before serializing the orchestrator config.
+    """
+    inference = config.inference
+    if inference is None or not inference.server.advertise:
+        return False
+
+    client = config.orchestrator.model.client
+    original_urls = list(client.base_url)
+    advertised_host = resolve_inference_advertise_host(inference.server.host)
+    advertised_urls = [replace_local_url_host(url, advertised_host) for url in original_urls]
+    if advertised_urls == original_urls:
+        return False
+
+    if client.admin_base_url is None:
+        client.admin_base_url = original_urls
+    client.base_url = advertised_urls
+    return True
+
+
 def rl_local(config: RLConfig):
     assert config.deployment.type == "single_node"
 
@@ -85,6 +162,9 @@ def rl_local(config: RLConfig):
         config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"),
         json_logging=config.log.json_logging,
     )
+
+    if configure_inference_advertisement(config):
+        logger.info(f"Advertising inference at {', '.join(config.orchestrator.model.client.base_url)}")
 
     config_dir = config.output_dir / "configs"
     write_subconfigs(config, config_dir)
