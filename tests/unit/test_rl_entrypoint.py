@@ -2,7 +2,9 @@ import tomllib
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
+from prime_rl.configs.inference import ServerConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.entrypoints.rl import (
     configure_inference_advertisement,
@@ -14,7 +16,7 @@ from prime_rl.entrypoints.rl import (
 def _config(
     *,
     advertise_host: str | None,
-    bind_host: str | None = None,
+    bind_host: str | None = "inference-a",
     base_url: list[str] | None = None,
     admin_base_url: list[str] | None = None,
 ):
@@ -35,11 +37,15 @@ def test_advertisement_is_opt_in():
     assert config.orchestrator.model.client.base_url == ["http://localhost:8000/v1"]
 
 
+def test_advertise_host_rejects_explicit_values():
+    with pytest.raises(ValidationError):
+        ServerConfig(advertise_host="inference-a")
+
+
 def test_auto_advertisement_uses_allocated_slurm_node_for_wildcard_bind():
     assert (
         resolve_inference_advertise_host(
             "0.0.0.0",
-            "auto",
             environ={"SLURMD_NODENAME": "inference-a"},
         )
         == "inference-a"
@@ -50,7 +56,6 @@ def test_auto_advertisement_falls_back_to_system_hostname():
     assert (
         resolve_inference_advertise_host(
             "::",
-            "auto",
             environ={},
             hostname_func=lambda: "inference-a",
         )
@@ -59,13 +64,13 @@ def test_auto_advertisement_falls_back_to_system_hostname():
 
 
 def test_auto_advertisement_uses_concrete_bind_host():
-    assert resolve_inference_advertise_host("10.0.0.4", "auto") == "10.0.0.4"
+    assert resolve_inference_advertise_host("10.0.0.4") == "10.0.0.4"
 
 
 @pytest.mark.parametrize("bind_host", ["localhost", "localhost.", "127.0.0.2", "0:0:0:0:0:0:0:1"])
 def test_advertisement_rejects_loopback_bind(bind_host):
     with pytest.raises(ValueError, match="loopback-only"):
-        resolve_inference_advertise_host(bind_host, "inference-a")
+        resolve_inference_advertise_host(bind_host)
 
 
 @pytest.mark.parametrize(
@@ -79,7 +84,7 @@ def test_advertisement_rejects_loopback_bind(bind_host):
     ],
 )
 def test_advertisement_replaces_all_local_only_url_forms(base_url):
-    config = _config(advertise_host="inference-a", base_url=[base_url])
+    config = _config(advertise_host="auto", base_url=[base_url])
 
     assert configure_inference_advertisement(config)
     assert config.orchestrator.model.client.base_url == ["http://inference-a:8000/v1"]
@@ -88,7 +93,7 @@ def test_advertisement_replaces_all_local_only_url_forms(base_url):
 
 def test_advertisement_preserves_remote_and_explicit_admin_urls():
     config = _config(
-        advertise_host="inference-a",
+        advertise_host="auto",
         base_url=["http://localhost:8000/v1", "http://inference-b:8000/v1"],
         admin_base_url=["http://admin:9000/v1"],
     )

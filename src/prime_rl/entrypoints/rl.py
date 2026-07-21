@@ -119,18 +119,15 @@ def _validate_advertised_host(host: str) -> str:
 
 def resolve_inference_advertise_host(
     bind_host: str | None,
-    advertise_host: str,
     *,
     environ: Mapping[str, str] | None = None,
     hostname_func: Callable[[], str] | None = None,
 ) -> str:
-    """Resolve an explicit or automatic host without performing network I/O."""
+    """Resolve the automatically advertised host without network I/O."""
     effective_bind_host = bind_host or "0.0.0.0"
     if _is_loopback_host(effective_bind_host):
         raise ValueError(f"Inference cannot be advertised while server.host is loopback-only: {effective_bind_host!r}")
 
-    if advertise_host != "auto":
-        return _validate_advertised_host(advertise_host)
     if not _is_unspecified_host(effective_bind_host):
         return _validate_advertised_host(effective_bind_host)
 
@@ -174,7 +171,7 @@ def configure_inference_advertisement(config: RLConfig) -> bool:
 
     client = config.orchestrator.model.client
     original_urls = list(client.base_url)
-    advertised_host = resolve_inference_advertise_host(inference.server.host, inference.server.advertise_host)
+    advertised_host = resolve_inference_advertise_host(inference.server.host)
     advertised_urls = [_replace_local_url_host(url, advertised_host) for url in original_urls]
     if advertised_urls == original_urls:
         return False

@@ -19,8 +19,8 @@ class ServerConfig(BaseConfig):
     port: int = 8000
     """Port to bind to."""
 
-    advertise_host: str | None = None
-    """Host exposed to remote model clients by the single-node RL launcher.
+    advertise_host: Literal["auto"] | None = None
+    """Advertised host selection for remote model clients.
 
     ``None`` preserves configured client URLs. ``"auto"`` uses a concrete
     bind host or the allocated Slurm node for wildcard binds.
