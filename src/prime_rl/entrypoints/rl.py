@@ -38,7 +38,6 @@ from prime_rl.utils.process import (
     monitor_process,
     set_proc_title,
 )
-from prime_rl.utils.uv import shell_quote, uv_sync_args_from_env
 
 RL_TOML = "rl.toml"
 RL_SBATCH = "rl.sbatch"
@@ -441,7 +440,6 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
     assert config.slurm.template_path is not None
 
     env = Environment(loader=FileSystemLoader(config.slurm.template_path.parent), keep_trailing_newline=True)
-    env.filters["shell_quote"] = shell_quote
     template = env.get_template(config.slurm.template_path.name)
 
     offload = config.inference.kv_cache_offload if config.inference is not None else None
@@ -468,14 +466,10 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
         if config.inference
         else {}
     )
-    slurm_template_vars = {
-        **config.slurm.template_vars,
-        "prime_rl_uv_sync_args": uv_sync_args_from_env(),
-    }
 
     if config.deployment.type == "single_node":
         script = template.render(
-            **slurm_template_vars,
+            **config.slurm.template_vars,
             config_path=config_dir / RL_TOML,
             output_dir=config.output_dir,
             gpus_per_node=config.deployment.gpus_per_node,
@@ -484,7 +478,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
         infer_deploy = config.inference.deployment
 
         script = template.render(
-            **slurm_template_vars,
+            **config.slurm.template_vars,
             is_disaggregated=True,
             config_dir=config_dir,
             output_dir=config.output_dir,
@@ -521,7 +515,7 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
         )
     else:
         script = template.render(
-            **slurm_template_vars,
+            **config.slurm.template_vars,
             is_disaggregated=False,
             config_dir=config_dir,  # TODO: should prob have each subconfig path separately
             output_dir=config.output_dir,

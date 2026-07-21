@@ -20,7 +20,6 @@ from prime_rl.utils.process import (
     monitor_process,
     set_proc_title,
 )
-from prime_rl.utils.uv import shell_quote, uv_sync_args_from_env
 
 SFT_TOML = "sft.toml"
 SFT_SBATCH = "sft.sbatch"
@@ -41,7 +40,6 @@ def write_slurm_script(config: SFTConfig, config_path: Path, script_path: Path) 
     assert config.slurm.template_path is not None
 
     env = Environment(loader=FileSystemLoader(config.slurm.template_path.parent), keep_trailing_newline=True)
-    env.filters["shell_quote"] = shell_quote
     template = env.get_template(config.slurm.template_path.name)
 
     trainer_env_vars = {
@@ -49,21 +47,17 @@ def write_slurm_script(config: SFTConfig, config_path: Path, script_path: Path) 
         **DEFAULT_TRAINER_ENV_VARS,
         **config.env_vars,
     }
-    slurm_template_vars = {
-        **config.slurm.template_vars,
-        "prime_rl_uv_sync_args": uv_sync_args_from_env(),
-    }
 
     if config.deployment.type == "single_node":
         script = template.render(
-            **slurm_template_vars,
+            **config.slurm.template_vars,
             config_path=config_path,
             output_dir=config.output_dir,
             gpus_per_node=config.deployment.gpus_per_node,
         )
     else:
         script = template.render(
-            **slurm_template_vars,
+            **config.slurm.template_vars,
             config_path=config_path,
             output_dir=config.output_dir,
             trainer_env_vars=trainer_env_vars,
