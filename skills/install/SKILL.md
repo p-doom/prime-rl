@@ -29,11 +29,6 @@ uv sync --all-extras --all-packages        # + all env packages (needed to train
 uv sync --package prime-rl --package gsm8k-v1  # core + just one env
 ```
 
-Mooncake is pinned to `0.3.8.post1`, the latest CPython 3.12 x86_64 wheel that
-supports glibc older than 2.35. Its binaries require `GLIBCXX_3.4.30`; on
-HAICORE, run `module load GCC/13.3.0` before launching jobs so that the required
-`libstdc++` is inherited by Slurm.
-
 Environment packages under `deps/research-environments/environments/*/*` and `deps/verifiers/environments/*` are uv **workspace members**, auto-discovered — adding a new env needs no `pyproject.toml` change. They are opt-in: a plain `uv sync` / `--all-extras` does not install them (and would remove them if already present — re-run with `--all-packages`, or `--inexact` to keep them). Install all with `--all-packages`, or a subset with repeated `--package <env>` (include `--package prime-rl` to keep the core). If two envs pin conflicting transitive versions (all members share one lock), add the loser to `[tool.uv.workspace].exclude`.
 
 When bumping a package past the workspace-wide `exclude-newer = "7 days"` window, add it (and any newly-required transitives) to `[tool.uv.exclude-newer-package]` before refreshing `uv.lock`.
