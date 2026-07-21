@@ -3839,15 +3839,15 @@ wheels = [
 
 [[package]]
 name = "mooncake-transfer-engine"
-version = "0.3.11.post1"
+version = "0.3.8.post1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
     { name = "requests" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/82/6c/92d517ba157a02b2612b06a00c7e3f366d1050e41cc50e1bdefa382a7dc0/mooncake_transfer_engine-0.3.11.post1-cp312-cp312-manylinux_2_35_x86_64.whl", hash = "sha256:5ea50146d0d65f0274a406db49a570d187ad04760e054a49627bf84158038ac0", size = 42661963, upload-time = "2026-05-24T12:08:40.453Z" },
-    { url = "https://files.pythonhosted.org/packages/3a/a4/a187adcd485ff27bdbdb5c2b4d9cf210427bc74bcaacfc8226409db17535/mooncake_transfer_engine-0.3.11.post1-cp312-cp312-manylinux_2_39_aarch64.whl", hash = "sha256:1ccad9f44cf1a67f4e0494bd02f505503139ab606ecbe76cd6050d7a069247d5", size = 18089789, upload-time = "2026-05-24T16:19:01.828Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/6b/01603587afcffcf55ab609110522ca49706458793d7f1d685eb2647af374/mooncake_transfer_engine-0.3.8.post1-cp312-cp312-manylinux_2_17_aarch64.manylinux_2_35_aarch64.whl", hash = "sha256:75ec26f93ad890c0ef01b6c00e8a720a3ee1c1fd307783dbf2ca6e594cc36c14", size = 13925603, upload-time = "2026-01-09T06:31:27.871Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/d2/16bbb5b2467648a99572145cf24086521a0003ba7a19ec0ea9aa8a067f4d/mooncake_transfer_engine-0.3.8.post1-cp312-cp312-manylinux_2_17_x86_64.manylinux_2_35_x86_64.whl", hash = "sha256:87057f13c4e5e07d78dc9b7804342ff3b86706c28bfbd35ab043ec902ec0e26f", size = 36878337, upload-time = "2026-01-09T06:28:33.665Z" },
 ]
 
 [[package]]
@@ -5241,7 +5241,7 @@ requires-dist = [
     { name = "kernels", marker = "extra == 'gpt-oss'" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "modelexpress", marker = "extra == 'modelexpress'", specifier = "==0.3.0" },
-    { name = "mooncake-transfer-engine", specifier = ">=0.3.10.post2" },
+    { name = "mooncake-transfer-engine", specifier = "==0.3.8.post1" },
     { name = "msgspec", specifier = ">=0.18" },
     { name = "nixl", marker = "extra == 'disagg'" },
     { name = "nixl-cu12", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" },
