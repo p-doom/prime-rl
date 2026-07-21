@@ -6,7 +6,6 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable, Mapping
 from ipaddress import ip_address
 from pathlib import Path
 from subprocess import Popen
@@ -81,13 +80,13 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
             tomli_w.dump(to_toml_dict(config.inference, exclude=exclude_inference), f)
 
 
-def _normalized_host(host: str) -> str:
+def normalize_host(host: str) -> str:
     """Normalize a hostname or IP literal for classification."""
     return host.strip().removeprefix("[").removesuffix("]").rstrip(".").casefold()
 
 
-def _is_loopback_host(host: str) -> bool:
-    normalized = _normalized_host(host)
+def is_loopback_host(host: str) -> bool:
+    normalized = normalize_host(host)
     if normalized == "localhost" or normalized.endswith(".localhost"):
         return True
     try:
@@ -96,53 +95,29 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-def _is_unspecified_host(host: str) -> bool:
+def is_unspecified_host(host: str) -> bool:
     try:
-        return ip_address(_normalized_host(host)).is_unspecified
+        return ip_address(normalize_host(host)).is_unspecified
     except ValueError:
         return False
 
 
-def _validate_advertised_host(host: str) -> str:
-    normalized = _normalized_host(host)
-    if not normalized or any(char in normalized for char in "/?#@") or any(char.isspace() for char in normalized):
-        raise ValueError(f"Invalid inference advertise host: {host!r}")
-    if ":" in normalized:
-        try:
-            ip_address(normalized)
-        except ValueError as exc:
-            raise ValueError(f"Inference advertise host must not include a scheme or port: {host!r}") from exc
-    if _is_loopback_host(normalized) or _is_unspecified_host(normalized):
-        raise ValueError(f"Inference advertise host is not remotely reachable: {host!r}")
-    return normalized
+def resolve_inference_advertise_host(bind_host: str | None) -> str:
+    """Resolve the host advertised to remote model clients."""
+    bind_host = bind_host or "0.0.0.0"
+    if is_loopback_host(bind_host):
+        raise ValueError(f"Inference cannot be advertised while server.host is loopback-only: {bind_host!r}")
+
+    if not is_unspecified_host(bind_host):
+        return normalize_host(bind_host)
+
+    return os.environ.get("SLURMD_NODENAME") or socket.gethostname()
 
 
-def resolve_inference_advertise_host(
-    bind_host: str | None,
-    *,
-    environ: Mapping[str, str] | None = None,
-    hostname_func: Callable[[], str] | None = None,
-) -> str:
-    """Resolve the automatically advertised host without network I/O."""
-    effective_bind_host = bind_host or "0.0.0.0"
-    if _is_loopback_host(effective_bind_host):
-        raise ValueError(f"Inference cannot be advertised while server.host is loopback-only: {effective_bind_host!r}")
-
-    if not _is_unspecified_host(effective_bind_host):
-        return _validate_advertised_host(effective_bind_host)
-
-    environment = os.environ if environ is None else environ
-    allocated_host = environment.get("SLURMD_NODENAME")
-    if not allocated_host:
-        get_hostname = socket.gethostname if hostname_func is None else hostname_func
-        allocated_host = get_hostname()
-    return _validate_advertised_host(allocated_host)
-
-
-def _replace_local_url_host(url: str, advertised_host: str) -> str:
+def replace_local_url_host(url: str, advertised_host: str) -> str:
     """Replace a local-only URL host while preserving all other components."""
     parsed = urlsplit(url)
-    if parsed.hostname is None or not (_is_loopback_host(parsed.hostname) or _is_unspecified_host(parsed.hostname)):
+    if parsed.hostname is None or not (is_loopback_host(parsed.hostname) or is_unspecified_host(parsed.hostname)):
         return url
 
     host = f"[{advertised_host}]" if ":" in advertised_host else advertised_host
@@ -169,7 +144,7 @@ def configure_inference_advertisement(config: RLConfig) -> bool:
     client = config.orchestrator.model.client
     original_urls = list(client.base_url)
     advertised_host = resolve_inference_advertise_host(inference.server.host)
-    advertised_urls = [_replace_local_url_host(url, advertised_host) for url in original_urls]
+    advertised_urls = [replace_local_url_host(url, advertised_host) for url in original_urls]
     if advertised_urls == original_urls:
         return False
 
