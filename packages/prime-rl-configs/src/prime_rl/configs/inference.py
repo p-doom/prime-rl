@@ -20,7 +20,11 @@ class ServerConfig(BaseConfig):
     """Port to bind to."""
 
     advertise: bool = False
-    """Advertise the host for remote model clients in single-node runs. If false, preserves model-client URLs."""
+    """Advertise inference to remote model clients in single-node runs.
+
+    Set to ``true`` to replace local-only model-client URLs with a reachable
+    host. When omitted or ``false``, configured client URLs are preserved.
+    """
 
     liveness_timeout_seconds: float = Field(30.0, gt=0)
     """Timeout in seconds for the ``/liveness`` endpoint's internal vLLM worker RPC. With Kubernetes liveness probes, keep the probe ``timeoutSeconds`` at least this high."""

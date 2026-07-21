@@ -157,7 +157,11 @@ def _replace_local_url_host(url: str, advertised_host: str) -> str:
 
 
 def configure_inference_advertisement(config: RLConfig) -> bool:
-    """Apply an explicitly configured host to local model-client URLs."""
+    """Advertise inference when ``server.advertise = true``.
+
+    Keep original URLs for colocated administrative traffic and replace
+    local-only rollout URLs before serializing the orchestrator config.
+    """
     inference = config.inference
     if inference is None or not inference.server.advertise:
         return False
