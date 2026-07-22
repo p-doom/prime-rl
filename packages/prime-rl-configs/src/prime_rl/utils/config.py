@@ -1,3 +1,4 @@
+from dataclasses import is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,8 @@ def _encode_model(model: BaseModel, dumped: dict) -> dict:
 def _encode_value(attr: Any, value: Any) -> Any:
     if isinstance(attr, BaseModel) and isinstance(value, dict):
         return _encode_model(attr, value)
+    if is_dataclass(attr) and isinstance(value, dict):
+        return {key: _encode_value(getattr(attr, key), item) for key, item in value.items() if item is not None}
     if isinstance(value, list) and isinstance(attr, (list, tuple)):
         return [_encode_value(a, v) for a, v in zip(attr, value)]
     if isinstance(value, dict) and isinstance(attr, dict):
