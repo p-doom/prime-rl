@@ -93,9 +93,19 @@ def get_step_path(path: Path, step: int) -> Path:
 
 
 def get_all_ckpt_steps(ckpt_dir: Path) -> list[int]:
-    """Gets all checkpoint steps from the checkpoint directory, sorted in ascending order."""
-    step_dirs = list(ckpt_dir.glob("step_*"))
-    return sorted([int(step_dir.name.split("_")[-1]) for step_dir in step_dirs])
+    """Gets all checkpoint steps from the checkpoint directory, sorted in ascending order.
+
+    Only ``step_<int>`` directories are counted; non-numeric suffixes (e.g. a manual backup
+    like ``step_600.buggy_bak``) and stray files are skipped so the scan cannot crash on them.
+    """
+    steps: list[int] = []
+    for step_dir in ckpt_dir.glob("step_*"):
+        if not step_dir.is_dir():
+            continue
+        suffix = step_dir.name.split("_")[-1]
+        if suffix.isdigit():
+            steps.append(int(suffix))
+    return sorted(steps)
 
 
 def get_stable_ckpt_steps(ckpt_dir: Path) -> list[int]:

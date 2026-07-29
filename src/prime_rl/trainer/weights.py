@@ -21,6 +21,7 @@ from transformers.utils import (
 
 from prime_rl.trainer.lora import (
     clean_lora_state_dict,
+    merge_lora_state_dict,
 )
 from prime_rl.utils.logger import get_logger
 
@@ -106,9 +107,16 @@ def save_state_dict(
 
 
 def gather_weights_on_master(
-    model: nn.Module, is_master: bool, dtype: torch.dtype = torch.bfloat16
+    model: nn.Module, is_master: bool, dtype: torch.dtype = torch.bfloat16, merge_lora: bool = False
 ) -> dict[str, Tensor]:
-    """Gather distributed weights on CPU on master rank."""
+    """Gather distributed weights on CPU on master rank.
+
+    ``merge_lora=True`` folds the trained LoRA delta into the base weights (single merged HF
+    checkpoint); the default ``False`` keeps the legacy behavior of dropping LoRA params and
+    keeping only the frozen base (used by the RL inference weight broadcast, which syncs the
+    adapter separately). Weight-checkpoint export sets this True when the adapter is not being
+    saved separately, otherwise the export would be byte-identical to the base model.
+    """
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, module="torch.distributed")
         warnings.filterwarnings("ignore", category=UserWarning, module="torch.distributed.*")
@@ -129,6 +137,9 @@ def gather_weights_on_master(
 
     # Always clean up the state dict for HF compatibility
     if any(".base_layer." in key or "lora_A" in key or "lora_B" in key for key in cpu_state.keys()):
-        cpu_state = clean_lora_state_dict(cpu_state)
+        if merge_lora:
+            cpu_state = merge_lora_state_dict(model, cpu_state)
+        else:
+            cpu_state = clean_lora_state_dict(cpu_state)
 
     return cpu_state

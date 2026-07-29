@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from prime_rl.configs.trainer import LoRAConfig
-from prime_rl.trainer.models.layers.lora import MultiLoRALinear, MultiLoRAModule
+from prime_rl.trainer.models.layers.lora import MultiLoRALinear, MultiLoRAModule, get_multilora_scaling
 from prime_rl.trainer.models.layers.lora.multi_moe import (
     MultiLoRAGptOssGroupedExperts,
     MultiLoRAGroupedExperts,
@@ -256,6 +256,89 @@ def clean_lora_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torc
         else:
             clean_state_dict[key] = value
 
+    return clean_state_dict
+
+
+def merge_lora_state_dict(
+    model: nn.Module, state_dict: Dict[str, torch.Tensor], run_idx: int = 0
+) -> Dict[str, torch.Tensor]:
+    """Fold the trained LoRA delta (adapter ``run_idx``) into the base weights and return a
+    single merged, HF-compatible state dict (LoRA params removed).
+
+    Counterpart to :func:`clean_lora_state_dict`, except the adapter is MERGED instead of
+    dropped. Used for weight-checkpoint export when ``save_adapter_separately=False`` — the
+    unmerged path (clean_lora_state_dict) writes only the frozen base, making every LoRA
+    export byte-identical to the base model. For each ``MultiLoRALinear`` at module path
+    ``M`` the gathered state dict holds the frozen base at ``M.weight`` (the ``base_layer.``
+    prefix is stripped by ``MultiLoRAModule._post_state_dict_hook``) and the adapter at
+    ``M.lora_A.<idx>`` (shape ``[rank, in]``) / ``M.lora_B.<idx>`` (shape ``[out, rank]``).
+    The merged weight is ``W = base + (alpha / rank) * (lora_B @ lora_A)`` — exactly the
+    effective linear map of ``MultiLoRALinear.forward`` for a single active adapter.
+
+    The merge is keyed off the GATHERED STATE DICT, not ``model.named_modules()``: the model
+    is torch.compiled (``layer.compile()``), so ``named_modules()`` paths carry an
+    ``_orig_mod.`` segment that the cleaned state-dict FQNs (via ``get_fqns``) do NOT, and
+    matching on module paths merges 0 adapters. The gathered adapter keys are
+    ``<prefix>.lora_A.<idx>`` / ``<prefix>.lora_B.<idx>`` (an ``nn.ParameterList`` over
+    ``n_adapters``); only the trained ``run_idx`` (default 0) is folded (untrained adapters
+    have ``lora_B == 0`` and would contribute nothing anyway). Scaling ``alpha/rank`` is the
+    per-run ``SCALING_FACTORS[run_idx]`` used at train time (uniform across modules).
+    """
+    import re
+
+    had_lora_keys = any("lora_A" in k or "lora_B" in k for k in state_dict)
+
+    # Per-run scaling = alpha/rank == SCALING_FACTORS[run_idx] (the value used in forward()).
+    scaling: float | None = None
+    try:
+        scaling = float(get_multilora_scaling()[run_idx].item())
+    except Exception:
+        for module in model.modules():
+            if isinstance(module, MultiLoRALinear):
+                scaling = float(module.alpha) / float(module.rank)
+                break
+    if had_lora_keys and scaling is None:
+        raise RuntimeError("merge_lora_state_dict: could not determine LoRA scaling factor (alpha/rank)")
+
+    a_key_re = re.compile(r"^(?P<prefix>.+)\.lora_A\.(?P<idx>\d+)$")
+    n_merged = 0
+    for a_key in [k for k in state_dict if ".lora_A." in k]:
+        m = a_key_re.match(a_key)
+        if m is None or int(m.group("idx")) != run_idx:
+            continue
+        prefix = m.group("prefix")
+        b_key = f"{prefix}.lora_B.{run_idx}"
+        if b_key not in state_dict:
+            continue
+        base_key = f"{prefix}.weight"
+        if base_key not in state_dict:
+            alt = f"{prefix}.base_layer.weight"
+            if alt not in state_dict:
+                raise KeyError(f"base weight for LoRA module {prefix!r} not found in gathered state dict")
+            base_key = alt
+        lora_A = state_dict[a_key].to(torch.float32)  # [rank, in]
+        lora_B = state_dict[b_key].to(torch.float32)  # [out, rank]
+        base = state_dict[base_key]
+        state_dict[base_key] = (base.to(torch.float32) + scaling * (lora_B @ lora_A)).to(base.dtype)
+        n_merged += 1
+
+    # Strip LoRA params and normalize any remaining base_layer.-prefixed keys to HF names.
+    clean_state_dict: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if "lora_A" in key or "lora_B" in key:
+            continue
+        if ".base_layer." in key:
+            clean_state_dict[key.replace(".base_layer.", ".")] = value
+        else:
+            clean_state_dict[key] = value
+
+    if had_lora_keys and n_merged == 0:
+        raise RuntimeError(
+            f"merge_lora_state_dict found LoRA adapter keys but merged 0 adapters for run {run_idx} "
+            "(run_idx mismatch or unexpected key naming) -- refusing to export unmerged base weights"
+        )
+    if n_merged:
+        get_logger().info(f"Merged {n_merged} LoRA adapter(s) (run {run_idx}) into base weights for export")
     return clean_state_dict
 
 

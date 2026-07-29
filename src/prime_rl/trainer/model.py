@@ -685,7 +685,13 @@ def get_model(
             "but this architecture resolved to model.impl='hf'."
         )
 
-    if config.vlm is not None and not (is_vlm_arch and custom_vlm_cls):
+    # PATCH (franz, on-policy CU): allow [model.vlm] on a VLM ARCH that has no
+    # registered custom PrimeRL class (e.g. dense qwen3_vl) — it falls through to
+    # the AutoModelForImageTextToText (hf) branch below, which the RL trainer
+    # already runs successfully for qwen3_vl. Setting [model.vlm] is REQUIRED for
+    # multimodal SFT (sft/data.py guard) but must not require a custom class here.
+    # Original: `not (is_vlm_arch and custom_vlm_cls)` — only error on non-VLM arch.
+    if config.vlm is not None and not is_vlm_arch:
         raise ValueError(
             "VLM training requires a registered custom PrimeRL VLM implementation; "
             f"{getattr(model_config, 'model_type', config.name)!r} has none."

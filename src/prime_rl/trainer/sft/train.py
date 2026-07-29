@@ -226,6 +226,23 @@ def train(config: SFTConfig):
         f"Starting from step {progress.step} (total_tokens={progress.total_tokens}, total_samples={progress.total_samples}, dataset_state={dataloader.state_dict()['dataset_state']})"
     )
 
+    # Export-only mode: re-emit a (fixed, LoRA-merged) HF weight checkpoint for an already-
+    # trained DCP step, then exit BEFORE the training loop. Used to regenerate weight
+    # checkpoints broken by the pre-merge export bug (unmerged LoRA -> export == base model).
+    # Guarded by an env var so normal SFT is unaffected. Requires --ckpt.resume-step <N>.
+    import os as _os
+
+    if _os.environ.get("PRIME_RL_EXPORT_ONLY") == "1":
+        export_step = checkpoint_step if checkpoint_step is not None else progress.step
+        if weight_ckpt_manager is not None:
+            logger.info(f"EXPORT_ONLY: re-writing merged weight checkpoint for step {export_step}")
+            weight_ckpt_manager.save(export_step, model, tokenizer, processor)
+        else:
+            logger.warning("EXPORT_ONLY set but no weight checkpoint manager configured; nothing to export")
+        torch.distributed.barrier()
+        logger.info("EXPORT_ONLY: done; exiting before training loop")
+        return
+
     cp_enabled = parallel_dims.cp_enabled
     cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
     cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None

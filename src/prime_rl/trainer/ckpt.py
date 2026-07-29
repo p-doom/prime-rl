@@ -442,10 +442,15 @@ class WeightCheckpointManager:
             step_path.mkdir(parents=True, exist_ok=True)
         torch.distributed.barrier()
 
-        # Gather all weights on master rank
+        # Gather all weights on master rank. Merge the trained LoRA delta into the base weights
+        # UNLESS the adapter is saved separately -- without this, the LoRA path drops the delta
+        # and the exported HF checkpoint is byte-identical to the base model.
+        merge_lora = has_lora_layers(model) and not self.config.save_adapter_separately
         self.logger.debug("Gathering weights on master rank for weight checkpoint")
         start_time = time.perf_counter()
-        state_dict = gather_weights_on_master(model, self.world.is_master, dtype=torch.bfloat16)
+        state_dict = gather_weights_on_master(
+            model, self.world.is_master, dtype=torch.bfloat16, merge_lora=merge_lora
+        )
         self.logger.debug(f"Gathered weights on master rank in {time.perf_counter() - start_time:.2f} seconds")
 
         # Remove tied weight keys to match original model format

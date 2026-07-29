@@ -130,16 +130,18 @@ override-dependencies = [
 # workspace members, so new envs need no per-package registration. Install them
 # with `uv sync --all-packages`.
 [tool.uv.workspace]
-members = [
-    "deps/research-environments/environments/*/*",
-    "deps/verifiers/environments/*",
-]
-# tau2-synth-v1 and tau3-bench-v1 pin `tau2` forks/revs that conflict with the
-# canonical tau2-bench-v1; a workspace shares one lock, so these can't coexist.
-exclude = [
-    "deps/research-environments/environments/tool_use/tau2_synth_v1",
-    "deps/research-environments/environments/tool_use/tau3_bench_v1",
-]
+# research-environments DROPPED from the workspace (franz, on-policy CU): a uv
+# workspace shares ONE lock across all members, and research-environments members
+# keep injecting broken/conflicting deps (pinchbench_v1 missing pyproject;
+# aime24-v1's protobuf pin conflicts with prime-rl[modelexpress]==0.3.0 ->
+# unsatisfiable). None are needed for single-node dense GRPO + vLLM. Excluding
+# the whole tree removes ALL such conflicts at once.
+members = []
+# ^ Was ["deps/research-environments/environments/*/*", "deps/verifiers/environments/*"].
+# The shared-lock forces prime-rl's `modelexpress` extra (protobuf<6) to co-resolve
+# with env members (alphabet-sort-v1/aime24-v1 -> prime-sandboxes -> protobuf>=6.31.1)
+# => unsatisfiable. We need NO bundled envs (our grounding env `rl_grounding` is an
+# external plugin package in the RL repo), so drop all workspace members.
 
 # ModelExpress 0.3.0 publishes protobuf<6 metadata, but its generated proto is
 # compatible with protobuf 6. prime-sandboxes requires protobuf>=6.31.1; keep
