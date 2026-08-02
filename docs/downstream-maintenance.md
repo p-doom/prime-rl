@@ -27,7 +27,9 @@ git diff --stat "$fork_base"..origin/downstream/main
 git diff origin/main...origin/downstream/main
 ```
 
-The current intentional overlay consists only of the three changes below.
+The current intentional overlay consists only of the four changes below. The
+asset-root requirement for projects that embed PrimeRL is tracked separately
+because it is not a change to this fork.
 
 ## Advertise inference to external environment servers
 
@@ -143,6 +145,35 @@ Retire the patch only when upstream has equivalent nested-dataclass handling
 and an actual resolved OSWorld `DesktopPoolConfig` can be written and reparsed
 without losing non-null fields.
 
+## Install NIXL with an external Python environment
+
+Source: [downstream PR #10](https://github.com/p-doom/prime-rl/pull/10)
+
+Files:
+
+- `scripts/install_nixl_from_source.sh`
+- `docs/advanced.md`
+
+Projects that install PrimeRL as an editable dependency use the parent
+project's virtual environment rather than `prime-rl/.venv`. Set
+`PRIME_RL_VENV_BIN` to that environment's `bin` directory before running the
+NIXL installer. The installer validates the selected interpreter and passes it
+explicitly to `uv pip`, while UCX and the built wheel remain under the PrimeRL
+checkout.
+
+Keep the default `prime-rl/.venv/bin` behavior for standalone checkouts. Do not
+replace this explicit override with environment discovery.
+
+## Preserve native assets when embedding PrimeRL
+
+This is a consuming-project integration contract, not part of the
+`downstream/main` overlay. The NIXL and llm-d installers write native assets to
+the PrimeRL checkout's `third_party/` directory. If a parent project overrides
+`slurm.project_dir` and carries custom Slurm templates, those templates must
+still resolve UCX and llm-d from `deps/prime-rl/third_party` (or pass an
+equivalent explicit asset root). Pointing them at the parent project's
+`third_party/` silently ignores the installed assets.
+
 ## History that is not part of the current fork
 
 The downstream merge graph retains commits whose changes were later removed.
@@ -198,6 +229,8 @@ Do not infer the live fork delta from downstream-only commit subjects alone.
      subconfiguration serialization.
    - In `utils/config.py`, retain nested-dataclass null filtering without
      weakening explicit-`None` handling for Pydantic models.
+   - In `install_nixl_from_source.sh`, retain `PRIME_RL_VENV_BIN` and ensure
+     every Python package operation targets the selected interpreter.
    - Treat changes to environment/source schemas, model-client URL ownership,
      and generated Slurm configs as integration changes even if Git reports no
      textual conflict.
@@ -231,8 +264,8 @@ Do not infer the live fork delta from downstream-only commit subjects alone.
    pull request. Check jobs with `squeue -u "$USER"` and `sacct -j <jobid>`.
 
 8. Review the final downstream overlay again. Every remaining change relative
-   to the upstream merge base should map to one of the three sections above or
-   be explained in this guide before merge.
+   to the upstream merge base should map to one of the four fork sections above
+   or be explained in this guide before merge.
 
 9. Push the sync branch and open a draft pull request targeting
    `downstream/main`. Never use an upstream sync pull request to update `main`,
