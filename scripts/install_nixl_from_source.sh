@@ -7,8 +7,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-VENV_BIN="$PROJECT_DIR/.venv/bin"
+VENV_BIN="${PRIME_RL_VENV_BIN:-$PROJECT_DIR/.venv/bin}"
 PYTHON="$VENV_BIN/python"
+
+if [ ! -x "$PYTHON" ]; then
+    echo "ERROR: Python interpreter not found: $PYTHON" >&2
+    echo "Run uv sync first or set PRIME_RL_VENV_BIN to the target environment's bin directory." >&2
+    exit 1
+fi
 
 # UCX's --with-verbs silently disables IB/RoCE support when the rdma-core *dev*
 # headers (verbs.h / rdma_cma.h) are missing, yielding a TCP-only build. On hosts
@@ -89,7 +95,7 @@ export LD_LIBRARY_PATH="$UCX_INSTALL/lib:$UCX_INSTALL/lib/ucx:${LD_LIBRARY_PATH:
 # Build and install directly (no auditwheel) so NIXL links to our UCX at runtime
 WHEEL_DIR="$PROJECT_DIR/deps"
 mkdir -p "$WHEEL_DIR"
-uv pip install pip 2>/dev/null
+uv pip install --python "$PYTHON" pip 2>/dev/null
 "$PYTHON" -m pip wheel . --no-deps --wheel-dir="$WHEEL_DIR"
 
 WHEEL=$(ls "$WHEEL_DIR"/nixl*.whl | head -1)

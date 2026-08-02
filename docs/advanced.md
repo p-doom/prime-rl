@@ -156,4 +156,8 @@ salloc -N 1 --gres=gpu:1 bash -c 'bash scripts/install_nixl_from_source.sh'
 uv pip install --reinstall --no-deps deps/nixl_cu12-*.whl
 ```
 
+Set `PRIME_RL_VENV_BIN` when the target environment is not the checkout's
+`.venv/bin`, for example when PrimeRL is installed as a dependency of another
+project.
+
 The script writes UCX 1.19 to `third_party/ucx/`; the bundled sbatch templates prepend it to `LD_LIBRARY_PATH` so it overrides the system version. Re-run both commands after every `uv sync`, since the lock pins the wheel.
