@@ -150,7 +150,6 @@ without losing non-null fields.
 Files:
 
 - `src/prime_rl/utils/monitor/wandb.py`
-- `tests/unit/utils/test_wandb_monitor.py`
 
 The declared W&B dependency range allows newer SDK releases, including 0.28.1,
 that no longer provide the `wandb_gql` module or the legacy
@@ -168,9 +167,9 @@ or reach back into the removed API client interface.
 
 The Workspaces helper is an internal API, so dependency updates are a conflict
 hotspot even when the import still succeeds. After changing either W&B
-dependency, import the monitor and exercise `list_views()` against a mocked
-response at minimum. Retire this patch when upstream uses a supported
-Workspaces API for discovering saved project views.
+dependency, verify that the monitor imports in the consuming environment and
+that saved-view discovery still works. Retire this patch when upstream uses a
+supported Workspaces API for discovering saved project views.
 
 ## Install NIXL with an external Python environment
 
