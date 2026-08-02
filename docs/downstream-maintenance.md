@@ -27,7 +27,7 @@ git diff --stat "$fork_base"..origin/downstream/main
 git diff origin/main...origin/downstream/main
 ```
 
-The current intentional overlay consists only of the four changes below. The
+The current intentional overlay consists only of the five changes below. The
 asset-root requirement for projects that embed PrimeRL is tracked separately
 because it is not a change to this fork.
 
@@ -145,6 +145,32 @@ Retire the patch only when upstream has equivalent nested-dataclass handling
 and an actual resolved OSWorld `DesktopPoolConfig` can be written and reparsed
 without losing non-null fields.
 
+## Use the W&B Workspaces GraphQL client
+
+Files:
+
+- `src/prime_rl/utils/monitor/wandb.py`
+
+The declared W&B dependency range allows newer SDK releases, including 0.28.1,
+that no longer provide the `wandb_gql` module or the legacy
+`wandb.Api().client.execute()` interface. A consuming project with such a lock
+therefore failed while importing the monitor, before a training job could
+start. `list_views()` now sends its query through
+`wandb_workspaces._graphql.execute_graphql()`, the helper shipped with the
+Workspaces package that already owns the saved-view workflow.
+
+Preserve the query variables and the existing result parsing when resolving
+W&B or Workspaces changes. This code intentionally passes the query as a string
+because the Workspaces helper parses it using the GraphQL implementation that
+matches the installed W&B SDK. Do not restore a direct `wandb_gql` dependency
+or reach back into the removed API client interface.
+
+The Workspaces helper is an internal API, so dependency updates are a conflict
+hotspot even when the import still succeeds. After changing either W&B
+dependency, verify that the monitor imports in the consuming environment and
+that saved-view discovery still works. Retire this patch when upstream uses a
+supported Workspaces API for discovering saved project views.
+
 ## Install NIXL with an external Python environment
 
 Source: [downstream PR #10](https://github.com/p-doom/prime-rl/pull/10)
@@ -229,6 +255,8 @@ Do not infer the live fork delta from downstream-only commit subjects alone.
      subconfiguration serialization.
    - In `utils/config.py`, retain nested-dataclass null filtering without
      weakening explicit-`None` handling for Pydantic models.
+   - In `utils/monitor/wandb.py`, keep saved-view queries on the GraphQL client
+     provided by the installed Workspaces package.
    - In `install_nixl_from_source.sh`, retain `PRIME_RL_VENV_BIN` and ensure
      every Python package operation targets the selected interpreter.
    - Treat changes to environment/source schemas, model-client URL ownership,
@@ -264,7 +292,7 @@ Do not infer the live fork delta from downstream-only commit subjects alone.
    pull request. Check jobs with `squeue -u "$USER"` and `sacct -j <jobid>`.
 
 8. Review the final downstream overlay again. Every remaining change relative
-   to the upstream merge base should map to one of the four fork sections above
+   to the upstream merge base should map to one of the five fork sections above
    or be explained in this guide before merge.
 
 9. Push the sync branch and open a draft pull request targeting
