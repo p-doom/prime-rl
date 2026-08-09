@@ -27,7 +27,7 @@ git diff --stat "$fork_base"..origin/downstream/main
 git diff origin/main...origin/downstream/main
 ```
 
-The current intentional overlay consists only of the five changes below. The
+The current intentional overlay consists only of the six changes below. The
 asset-root requirement for projects that embed PrimeRL is tracked separately
 because it is not a change to this fork.
 
@@ -170,6 +170,23 @@ hotspot even when the import still succeeds. After changing either W&B
 dependency, verify that the monitor imports in the consuming environment and
 that saved-view discovery still works. Retire this patch when upstream uses a
 supported Workspaces API for discovering saved project views.
+
+## Preserve component configs in shared W&B runs
+
+Files:
+
+- `src/prime_rl/utils/monitor/wandb.py`
+
+RL launches use one shared W&B run with the orchestrator as the primary writer
+and the trainer as a secondary writer. Upstream passes each component's config
+to `wandb.init()` without a namespace, and the secondary trainer config is not
+retained in the shared run. Namespace shared configs by their writer label and
+explicitly publish them after attaching, so W&B stores both
+`orchestrator.optim.lr` and `trainer.optim.lr` without changing which value the
+trainer uses.
+
+Retire this patch when upstream preserves namespaced configs from every writer
+in shared W&B runs.
 
 ## Install NIXL with an external Python environment
 

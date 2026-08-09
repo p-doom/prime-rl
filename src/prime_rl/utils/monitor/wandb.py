@@ -43,6 +43,18 @@ def _loggable_task(task) -> str:
     return json.dumps(elide(task.model_dump(mode="json")))
 
 
+def _run_config_payload(
+    run_config: BaseConfig | None, *, shared_mode: bool, label: str | None
+) -> dict[str, Any] | None:
+    if run_config is None:
+        return None
+
+    payload = run_config.model_dump()
+    if shared_mode and label is not None:
+        return {label: payload}
+    return payload
+
+
 class WandbMonitor(Monitor):
     """Logs to Weights and Biases."""
 
@@ -78,6 +90,7 @@ class WandbMonitor(Monitor):
         # requires a server connection and can't work offline.
         _wandb_mode = os.environ.get("WANDB_MODE")
         shared_mode = os.environ.get("WANDB_SHARED_MODE") == "1" and _wandb_mode not in ("disabled", "offline")
+        label = None
         if shared_mode:
             run_id = os.environ.get("WANDB_SHARED_RUN_ID")
             label = os.environ.get("WANDB_SHARED_LABEL")
@@ -97,6 +110,7 @@ class WandbMonitor(Monitor):
             settings = wandb.Settings(mode=mode)
             is_online = mode == "online"
 
+        run_config_payload = _run_config_payload(run_config, shared_mode=shared_mode, label=label)
         retryable_errors = (CommError, ServerResponseError) if shared_mode else (CommError,)
 
         def init_wandb(max_retries: int):
@@ -111,7 +125,7 @@ class WandbMonitor(Monitor):
                         group=config.group,
                         tags=config.tags,
                         dir=output_dir,
-                        config=run_config.model_dump() if run_config else None,
+                        config=run_config_payload,
                         settings=settings,
                     )
                 except retryable_errors as e:
@@ -136,6 +150,9 @@ class WandbMonitor(Monitor):
         max_retries = 30 if shared_mode and not primary else 5
         self.wandb = init_wandb(max_retries)
         self.run_id = self.wandb.id
+        if shared_mode and run_config_payload is not None:
+            # Ensure non-primary writers publish their component config after attaching to the shared run.
+            self.wandb.config.update(run_config_payload, allow_val_change=True)
 
         wandb.define_metric("*", step_metric="step")
 
