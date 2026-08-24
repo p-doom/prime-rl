@@ -22,6 +22,7 @@ from transformers.utils import (
 from prime_rl.trainer.lora import (
     clean_lora_state_dict,
 )
+from prime_rl.trainer.lora_merge import merge_lora_state_dict
 from prime_rl.utils.logger import get_logger
 
 
@@ -105,10 +106,10 @@ def save_state_dict(
             torch.save(state_dict, save_dir / weights_name)
 
 
-def gather_weights_on_master(
+def _gather_state_dict_on_master(
     model: nn.Module, is_master: bool, dtype: torch.dtype = torch.bfloat16
 ) -> dict[str, Tensor]:
-    """Gather distributed weights on CPU on master rank."""
+    """Gather the model state dict on CPU on the master rank."""
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=FutureWarning, module="torch.distributed")
         warnings.filterwarnings("ignore", category=UserWarning, module="torch.distributed.*")
@@ -127,8 +128,43 @@ def gather_weights_on_master(
                 cpu_state[key] = value.to("cpu", non_blocking=False)
         torch.distributed.barrier()
 
-    # Always clean up the state dict for HF compatibility
+    return cpu_state
+
+
+def gather_weights_on_master(
+    model: nn.Module, is_master: bool, dtype: torch.dtype = torch.bfloat16
+) -> dict[str, Tensor]:
+    """Gather distributed weights and remove LoRA adapters on the master rank."""
+    cpu_state = _gather_state_dict_on_master(model, is_master, dtype)
     if any(".base_layer." in key or "lora_A" in key or "lora_B" in key for key in cpu_state.keys()):
         cpu_state = clean_lora_state_dict(cpu_state)
 
     return cpu_state
+
+
+def gather_merged_lora_weights_on_master(
+    model: nn.Module,
+    is_master: bool,
+    *,
+    expected_rank: int,
+    scaling: float,
+    dtype: torch.dtype = torch.bfloat16,
+) -> dict[str, Tensor]:
+    """Gather and merge run zero's linear LoRA adapter on the master rank."""
+    cpu_state = _gather_state_dict_on_master(model, is_master, dtype)
+    merged: dict[str, Tensor] = {}
+    verdict: list[tuple[bool, str]] = [(True, "")]
+    if is_master:
+        try:
+            merged = merge_lora_state_dict(
+                cpu_state,
+                expected_rank=expected_rank,
+                scaling=scaling,
+            )
+        except ValueError as error:
+            verdict[0] = (False, str(error))
+    torch.distributed.broadcast_object_list(verdict, src=0)
+    valid, message = verdict[0]
+    if not valid:
+        raise ValueError(message)
+    return merged

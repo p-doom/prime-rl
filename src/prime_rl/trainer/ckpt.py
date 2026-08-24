@@ -27,6 +27,7 @@ from prime_rl.trainer.models import PreTrainedModelPrimeRL
 from prime_rl.trainer.optim import CPUOffloadOptimizer
 from prime_rl.trainer.runs import Progress, get_multi_run_manager
 from prime_rl.trainer.weights import (
+    gather_merged_lora_weights_on_master,
     gather_weights_on_master,
     save_state_dict,
 )
@@ -435,25 +436,51 @@ class WeightCheckpointManager:
         processor: ProcessorMixin | None = None,
     ):
         """Save a HF-compatible weight-only checkpoint for a given step."""
+        has_lora = has_lora_layers(model)
+        lora_export: tuple[int, float] | None = None
+        if has_lora and not self.config.save_adapter_separately:
+            run_manager = get_multi_run_manager()
+            if run_manager.max_runs != 1:
+                raise ValueError("merged LoRA weight export requires exactly one run slot")
+            if set(run_manager.config) != {0}:
+                raise ValueError("merged LoRA weight export requires the live run 0 config")
+            run_lora = run_manager.config[0].model.lora
+            if run_lora is None or run_lora.rank is None or run_lora.alpha is None:
+                raise ValueError("merged LoRA weight export requires resolved run 0 LoRA metadata")
+            lora_export = (run_lora.rank, run_lora.alpha / run_lora.rank)
+
         step_path = self.get_step_path(step)
+        self.logger.debug("Gathering weights on master rank for weight checkpoint")
+        start_time = time.perf_counter()
+        if lora_export is not None:
+            expected_rank, scaling = lora_export
+            state_dict = gather_merged_lora_weights_on_master(
+                model,
+                self.world.is_master,
+                expected_rank=expected_rank,
+                scaling=scaling,
+                dtype=torch.bfloat16,
+            )
+        else:
+            state_dict = gather_weights_on_master(
+                model,
+                self.world.is_master,
+                dtype=torch.bfloat16,
+            )
+        self.logger.debug(f"Gathered weights on master rank in {time.perf_counter() - start_time:.2f} seconds")
+
         # Master-only mkdir + barrier: concurrent mkdir from every rank can
         # re-raise FileExistsError on a parallel FS (EEXIST + stale is_dir()).
         if self.world.is_master:
             step_path.mkdir(parents=True, exist_ok=True)
         torch.distributed.barrier()
 
-        # Gather all weights on master rank
-        self.logger.debug("Gathering weights on master rank for weight checkpoint")
-        start_time = time.perf_counter()
-        state_dict = gather_weights_on_master(model, self.world.is_master, dtype=torch.bfloat16)
-        self.logger.debug(f"Gathered weights on master rank in {time.perf_counter() - start_time:.2f} seconds")
-
         # Remove tied weight keys to match original model format
         if getattr(model.config, "tie_word_embeddings", False):
             for key in getattr(model, "_tied_weights_keys", []):
                 state_dict.pop(key, None)
 
-        if has_lora_layers(model) and self.config.save_adapter_separately:
+        if has_lora and self.config.save_adapter_separately:
             self.logger.debug("Getting run adapter state dict for weight checkpoint")
             start_time = time.perf_counter()
             lora_state_dict = self.get_run_adapter_state_dict()
