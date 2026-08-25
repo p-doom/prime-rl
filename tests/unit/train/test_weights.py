@@ -15,6 +15,13 @@ from prime_rl.configs.orchestrator import ModelConfig as RunModelConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.trainer.ckpt import WeightCheckpointManager
 from prime_rl.trainer.lora_merge import merge_lora_state_dict
+from prime_rl.trainer.models.layers.lora.base import set_lora_num_tokens, set_multilora_scaling
+from prime_rl.trainer.models.layers.lora.multi_moe import (
+    MultiLoRAGptOssGroupedExperts,
+    MultiLoRAGroupedExperts,
+    MultiLoRANonGatedGroupedExperts,
+)
+from prime_rl.trainer.models.layers.moe import GptOssGroupedExperts, GroupedExperts, NonGatedGroupedExperts
 from prime_rl.trainer.runs import MultiRunManager
 
 
@@ -107,10 +114,18 @@ def test_merge_lora_state_dict_merges_selected_linear_adapter_without_mutating_i
         (
             {
                 "model.proj.weight": torch.zeros(2, 3),
-                "model.proj.w1_lora_A.0": torch.zeros(1, 3),
-                "model.proj.w1_lora_B.0": torch.zeros(2, 1),
+                "model.proj.w4_lora_A.0": torch.zeros(1, 3),
+                "model.proj.w4_lora_B.0": torch.zeros(2, 1),
             },
             "unsupported LoRA key",
+        ),
+        (
+            {
+                "model.experts.w1": torch.zeros(2, 3),
+                "model.experts.w1_lora_A.0": torch.zeros(1, 3),
+                "model.experts.w1_lora_B.0": torch.zeros(2, 1),
+            },
+            "incompatible LoRA shapes",
         ),
         (
             {
@@ -162,12 +177,66 @@ def test_merge_lora_state_dict_rejects_a_rank_different_from_live_metadata():
         merge_lora_state_dict(state_dict, expected_rank=2, scaling=1.0)
 
 
+def test_merge_lora_state_dict_merges_every_production_moe_schema():
+    set_lora_num_tokens(torch.zeros(1, dtype=torch.long), reset_reference=True)
+    set_multilora_scaling(torch.ones(1), reset_reference=True)
+    cases = [
+        (
+            MultiLoRAGroupedExperts(
+                GroupedExperts(dim=4, hidden_dim=6, num_experts=2, use_grouped_mm=False),
+                rank=2,
+                n_adapters=1,
+                use_grouped_mm=False,
+            ),
+            {"model.experts.w1", "model.experts.w2", "model.experts.w3"},
+        ),
+        (
+            MultiLoRANonGatedGroupedExperts(
+                NonGatedGroupedExperts(input_dim=4, intermediate_dim=6, num_experts=2, use_grouped_mm=False),
+                rank=2,
+                n_adapters=1,
+                use_grouped_mm=False,
+            ),
+            {"model.experts.w1", "model.experts.w2"},
+        ),
+        (
+            MultiLoRAGptOssGroupedExperts(
+                GptOssGroupedExperts(hidden_size=4, intermediate_size=6, num_experts=2, use_grouped_mm=False),
+                rank=2,
+                n_adapters=1,
+                use_grouped_mm=False,
+            ),
+            {"model.experts.gate_up_proj", "model.experts.down_proj"},
+        ),
+    ]
+
+    for module, adapted_keys in cases:
+        with torch.no_grad():
+            for name, parameter in module.named_parameters():
+                parameter.fill_(1.0 if "lora_" in name else 0.0)
+        state_dict = module.state_dict(prefix="model.experts.")
+        base_schema = module.base_layer.state_dict(prefix="model.experts.")
+
+        merged = merge_lora_state_dict(state_dict, expected_rank=2, scaling=0.5)
+
+        if any("lora_" in key for key in merged):
+            pytest.fail(f"merged state retained LoRA keys: {sorted(merged)}")
+        if set(merged) != set(base_schema):
+            pytest.fail(f"merged state changed the emitted base schema: {sorted(merged)}")
+        for key in adapted_keys:
+            torch.testing.assert_close(merged[key], torch.ones_like(merged[key]))
+
+
 @pytest.mark.parametrize(
     "extra",
     [
         {
             "model.proj.lora_A.1": torch.zeros(1, 3),
             "model.proj.lora_B.1": torch.zeros(2, 1),
+        },
+        {
+            "model.experts.w1_lora_A.1": torch.zeros(2, 1, 3),
+            "model.experts.w1_lora_B.1": torch.zeros(2, 2, 1),
         },
         {"model.proj.lora_C.0": torch.zeros(2, 1)},
     ],

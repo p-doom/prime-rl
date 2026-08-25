@@ -150,7 +150,7 @@ def gather_merged_lora_weights_on_master(
     scaling: float,
     dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, Tensor]:
-    """Gather and merge run zero's linear LoRA adapter on the master rank."""
+    """Gather and merge run zero's LoRA adapter on the master rank."""
     cpu_state = _gather_state_dict_on_master(model, is_master, dtype)
     merged: dict[str, Tensor] = {}
     verdict: list[tuple[bool, str]] = [(True, "")]
