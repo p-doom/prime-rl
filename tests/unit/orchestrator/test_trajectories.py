@@ -85,3 +85,24 @@ def test_trace_to_samples_preserves_nested_branches():
     ]
     if actual != expected:
         pytest.fail(f"nested branches changed to {actual!r}")
+
+
+def test_trace_to_samples_associates_logprobs_with_masked_tokens():
+    trace = _trace(
+        [
+            _node(
+                parent=None,
+                sampled=True,
+                token_ids=[7, 8, 9],
+                mask=[True, False, True],
+                logprobs=[-0.7, -0.9],
+            )
+        ]
+    )
+
+    samples = trace_to_samples(trace, env_name="test-env")
+
+    actual = [(sample.token_ids, sample.mask, sample.logprobs) for sample in samples]
+    expected = [([7, 8, 9], [True, False, True], [-0.7, 0.0, -0.9])]
+    if actual != expected:
+        pytest.fail(f"logprobs changed token association: {actual!r}")
