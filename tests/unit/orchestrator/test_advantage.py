@@ -48,7 +48,7 @@ def _build_rollout(
             message=vf.UserMessage(content="q"),
             token_ids=prompt_ids,
             mask=[False] * len(prompt_ids),
-            logprobs=[0.0] * len(prompt_ids),
+            logprobs=[],
             sampled=False,
             parent=parent,
         )
@@ -90,7 +90,7 @@ def _build_rollout(
                     message=vf.ToolMessage(content="t", tool_call_id="x"),
                     token_ids=obs_ids,
                     mask=[False] * obs_lengths[i],
-                    logprobs=[0.0] * obs_lengths[i],
+                    logprobs=[],
                     sampled=False,
                     parent=parent,
                 )

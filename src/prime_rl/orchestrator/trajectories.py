@@ -106,6 +106,14 @@ def trace_to_samples(
     the branch tokens). Branches with no sampled tokens (e.g. an openai client carrying none)
     yield nothing.
     """
+    for index, node in enumerate(trace.nodes):
+        if len(node.token_ids) != len(node.mask):
+            raise ValueError(f"trace node {index} has {len(node.token_ids)} token ids but {len(node.mask)} mask values")
+        if sum(node.mask) != len(node.logprobs):
+            raise ValueError(
+                f"trace node {index} has {sum(node.mask)} sampled tokens but {len(node.logprobs)} logprobs"
+            )
+
     samples: list[TrainingSample] = []
     for branch, mask in iter_trainable_branches(trace):
         token_ids = branch.token_ids
