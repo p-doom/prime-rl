@@ -27,6 +27,7 @@ from prime_rl.trainer.models import PreTrainedModelPrimeRL
 from prime_rl.trainer.optim import CPUOffloadOptimizer
 from prime_rl.trainer.runs import Progress, get_multi_run_manager
 from prime_rl.trainer.weights import (
+    gather_merged_lora_weights_on_master,
     gather_weights_on_master,
     save_state_dict,
 )
@@ -435,6 +436,25 @@ class WeightCheckpointManager:
         processor: ProcessorMixin | None = None,
     ):
         """Save a HF-compatible weight-only checkpoint for a given step."""
+        has_lora = has_lora_layers(model)
+        if has_lora:
+            run_manager = get_multi_run_manager()
+            if run_manager.max_runs != 1:
+                raise ValueError("merged LoRA weight export requires exactly one run slot")
+
+        self.logger.debug("Gathering weights on master rank for weight checkpoint")
+        start_time = time.perf_counter()
+        if has_lora:
+            state_dict = gather_merged_lora_weights_on_master(
+                model,
+                self.world.is_master,
+                scaling=run_manager.scaling_factors[0].item(),
+                dtype=torch.bfloat16,
+            )
+        else:
+            state_dict = gather_weights_on_master(model, self.world.is_master, dtype=torch.bfloat16)
+        self.logger.debug(f"Gathered weights on master rank in {time.perf_counter() - start_time:.2f} seconds")
+
         step_path = self.get_step_path(step)
         # Master-only mkdir + barrier: concurrent mkdir from every rank can
         # re-raise FileExistsError on a parallel FS (EEXIST + stale is_dir()).
@@ -442,18 +462,12 @@ class WeightCheckpointManager:
             step_path.mkdir(parents=True, exist_ok=True)
         torch.distributed.barrier()
 
-        # Gather all weights on master rank
-        self.logger.debug("Gathering weights on master rank for weight checkpoint")
-        start_time = time.perf_counter()
-        state_dict = gather_weights_on_master(model, self.world.is_master, dtype=torch.bfloat16)
-        self.logger.debug(f"Gathered weights on master rank in {time.perf_counter() - start_time:.2f} seconds")
-
         # Remove tied weight keys to match original model format
         if getattr(model.config, "tie_word_embeddings", False):
             for key in getattr(model, "_tied_weights_keys", []):
                 state_dict.pop(key, None)
 
-        if has_lora_layers(model) and self.config.save_adapter_separately:
+        if has_lora and self.config.save_adapter_separately:
             self.logger.debug("Getting run adapter state dict for weight checkpoint")
             start_time = time.perf_counter()
             lora_state_dict = self.get_run_adapter_state_dict()
