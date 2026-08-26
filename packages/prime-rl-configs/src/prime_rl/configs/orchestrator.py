@@ -35,7 +35,7 @@ class LoRAConfig(BaseConfig):
     """LoRA adapter name. If None, auto-generated from rank and alpha."""
 
     rank: int | None = Field(None, ge=1)
-    """LoRA rank for this run. Must be ≤ trainer's max rank. If None, uses the trainer's rank."""
+    """LoRA rank for this run. Must match the trainer rank. If None, uses the trainer's rank."""
 
     alpha: float | None = Field(None, ge=0)
     """LoRA alpha for this run. If None, uses the trainer's alpha."""

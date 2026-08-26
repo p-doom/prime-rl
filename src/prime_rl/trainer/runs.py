@@ -549,10 +549,10 @@ def setup_multi_run_manager(
                 orch_config.model.lora.rank = trainer_lora.rank
             if orch_config.model.lora.alpha is None:
                 orch_config.model.lora.alpha = trainer_lora.alpha
-            if orch_config.model.lora.rank > trainer_lora.rank:
+            if orch_config.model.lora.rank != trainer_lora.rank:
                 return (
                     False,
-                    f"orchestrator.model.lora.rank ({orch_config.model.lora.rank}) exceeds trainer max rank ({trainer_lora.rank})",
+                    f"orchestrator.model.lora.rank ({orch_config.model.lora.rank}) must match trainer rank ({trainer_lora.rank})",
                 )
             return True, ""
 

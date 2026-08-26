@@ -3,9 +3,14 @@ from typing import Generator
 
 import pytest
 import tomli_w
+import torch
 import torch.distributed as dist
 
-from prime_rl.trainer.runs import MultiRunManager
+from prime_rl.configs.orchestrator import LoRAConfig as RunLoRAConfig
+from prime_rl.configs.orchestrator import ModelConfig as RunModelConfig
+from prime_rl.configs.orchestrator import OrchestratorConfig
+from prime_rl.configs.trainer import LoRAConfig
+from prime_rl.trainer.runs import MultiRunManager, setup_multi_run_manager
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -62,6 +67,19 @@ def test_initial_state(tmp_path: Path) -> None:
     assert len(multi_run_manager.id_2_idx) == 0
     assert len(multi_run_manager.unused_idxs) == 5
     assert multi_run_manager.run_dirs() == []
+
+
+@pytest.mark.parametrize(("run_rank", "valid"), [(None, True), (16, True), (8, False), (32, False)])
+def test_run_lora_rank_must_match_the_trainer(tmp_path: Path, run_rank: int | None, valid: bool) -> None:
+    manager = setup_multi_run_manager(tmp_path, 1, torch.device("cpu"), LoRAConfig(rank=16))
+    config = OrchestratorConfig.model_construct(
+        model=RunModelConfig.model_construct(lora=RunLoRAConfig(rank=run_rank, alpha=32.0))
+    )
+
+    actual, _ = manager._config_validation_hooks[0](config)
+
+    if actual is not valid:
+        pytest.fail(f"rank validation returned {actual!r}, expected {valid!r}")
 
 
 def test_detect_new_runs(tmp_path: Path) -> None:
