@@ -27,7 +27,7 @@ git diff --stat "$fork_base"..origin/downstream/main
 git diff origin/main...origin/downstream/main
 ```
 
-The current intentional overlay consists only of the five changes below. The
+The current intentional overlay consists only of the six changes below. The
 asset-root requirement for projects that embed PrimeRL is tracked separately
 because it is not a change to this fork.
 
@@ -177,6 +177,23 @@ checkout.
 Keep the default `prime-rl/.venv/bin` behavior for standalone checkouts. Do not
 replace this explicit override with environment discovery.
 
+## Re-parse the single-node `rl.json`
+
+Source: upstream [PR #3924](https://github.com/PrimeIntellect-ai/prime-rl/pull/3924),
+carried until it merges
+
+Files:
+
+- `src/prime_rl/entrypoints/rl.py`
+- `tests/unit/test_configs.py`
+
+A single-node Slurm launch writes the resolved config to `rl.json`, and the job
+runs `rl @ rl.json`. Upstream PR #3788 made `rl` reject a set
+`weight_broadcast.inference_world_size`, which that dump always contains for an
+NCCL or NIXL broadcast, so every such job failed before it started.
+`write_config` now leaves the field out. Drop this patch at the first sync that
+contains upstream's fix.
+
 ## Preserve native assets when embedding PrimeRL
 
 This is a consuming-project integration contract, not part of the
@@ -288,7 +305,7 @@ Do not infer the live fork delta from downstream-only commit subjects alone.
    pull request. Check jobs with `squeue -u "$USER"` and `sacct -j <jobid>`.
 
 8. Review the final downstream overlay again. Every remaining change relative
-   to the upstream merge base should map to one of the five fork sections above
+   to the upstream merge base should map to one of the six fork sections above
    or be explained in this guide before merge.
 
 9. Push the sync branch and open a draft pull request targeting
