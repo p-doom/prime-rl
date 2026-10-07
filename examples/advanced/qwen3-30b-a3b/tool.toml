@@ -9,7 +9,7 @@ type = "multi_node"
 num_train_nodes = 1
 num_infer_nodes = 1
 
-[wandb]
+[monitors.wandb]
 project = "general-agent-debug"
 name = "qwen3-30b-a3b-rlm"
 
@@ -32,30 +32,22 @@ freq = 1
 
 [orchestrator]
 batch_size = 512
-group_size = 16
 max_off_policy_steps = 32
 
+[orchestrator.train]
+group_size = 16
+
 [[orchestrator.train.source]]
-
-[orchestrator.train.source.env.taskset]
-id = "general-agent-v1"
-min_tier = 1
-
-[orchestrator.train.source.env.taskset.task.tools]
-colocated = true
-
-[orchestrator.train.source.env.agent.harness]
-id = "null"
-
-[orchestrator.train.source.env.agent.runtime]
-type = "modal"
+env.taskset.id = "general-agent"
+env.taskset.min_tier = 1
+env.taskset.task.tools.colocated = true
+env.agent.harness.id = "null"
+env.agent.runtime.type = "modal"
 
 [inference]
-gpu_memory_utilization = 0.85
 
-[inference.model]
+[inference.vllm]
 max_model_len = 32768
-
-[inference.parallel]
-dp = 2
-tp = 4
+data_parallel_size = 2
+tensor_parallel_size = 4
+gpu_memory_utilization = 0.85

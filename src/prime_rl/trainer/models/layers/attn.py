@@ -5,6 +5,8 @@ from typing import Literal
 import torch
 from torch import nn
 
+from prime_rl.trainer.models.fusions import fuse_qkv_projections
+
 from .norms import RMSNorm, RMSNormConfig
 from .rotary_emb import apply_rotary_pos_emb
 
@@ -22,8 +24,113 @@ except ImportError:
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
+    from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 except ImportError:
     flash_attn_4_varlen_func = None  # type: ignore
+    _flash_attn_bwd = _flash_attn_fwd = None  # type: ignore
+
+
+# FA4's flash_attn_varlen_func is a Python autograd.Function that Dynamo cannot trace. Inside a
+# checkpointed block that graph break drops the whole block to eager, so FA4 is exposed as an
+# opaque custom op instead, which also lets selective activation checkpointing save its output.
+@torch.library.custom_op("prime_rl_attn::flash_attn_4_varlen", mutates_args=())
+def _flash_attn_4_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    causal: bool,
+    window_size_left: int | None,
+    window_size_right: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out, lse, _, _ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        causal=causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        return_lse=True,
+    )
+    return out, lse
+
+
+@_flash_attn_4_varlen.register_fake
+def _(q, k, v, cu_seqlens_q, cu_seqlens_k, causal, window_size_left, window_size_right):
+    out = q.new_empty((*q.shape[:-1], v.shape[-1]))
+    lse = q.new_empty((q.shape[1], q.shape[0]), dtype=torch.float32)
+    return out, lse
+
+
+@torch.library.custom_op("prime_rl_attn::flash_attn_4_varlen_backward", mutates_args=())
+def _flash_attn_4_varlen_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    causal: bool,
+    window_size_left: int | None,
+    window_size_right: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dq, dk, dv = _flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        causal=causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+    )
+    return dq, dk, dv
+
+
+@_flash_attn_4_varlen_backward.register_fake
+def _(dout, q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, causal, window_size_left, window_size_right):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def _flash_attn_4_varlen_setup_context(ctx, inputs, output) -> None:
+    q, k, v, cu_seqlens_q, cu_seqlens_k, causal, window_size_left, window_size_right = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)
+    ctx.causal = causal
+    ctx.window_size = (window_size_left, window_size_right)
+
+
+def _flash_attn_4_varlen_autograd(ctx, dout: torch.Tensor, _dlse: torch.Tensor | None):
+    q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+    dq, dk, dv = _flash_attn_4_varlen_backward(
+        dout.contiguous(), q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, ctx.causal, *ctx.window_size
+    )
+    return dq, dk, dv, None, None, None, None, None
+
+
+_flash_attn_4_varlen.register_autograd(_flash_attn_4_varlen_autograd, setup_context=_flash_attn_4_varlen_setup_context)
+
+
+def flash_attn_4_varlen_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    causal: bool = False,
+    window_size: tuple[int | None, int | None] = (None, None),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop-in for FA4's ``flash_attn_varlen_func`` as called by ``FlashAttention``, routed through the custom op."""
+    return _flash_attn_4_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal, window_size[0], window_size[1])
 
 
 @dataclass
@@ -48,10 +155,12 @@ class AttentionConfig:
 class FlashAttention(nn.Module):
     """Flash Attention"""
 
+    supported_fusions = {"qkv": fuse_qkv_projections}
+
     _funcs = {
         2: flash_attn_varlen_func,
         3: flash_attn_3_varlen_func,
-        4: flash_attn_4_varlen_func,
+        4: flash_attn_4_varlen_op,
     }
 
     def __init__(self, config: AttentionConfig, flash_attn_version: int = 2):
@@ -61,15 +170,15 @@ class FlashAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.is_causal = config.is_causal
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        self.qkv_sizes = (
+            config.num_attention_heads * self.head_dim,
+            config.num_key_value_heads * self.head_dim,
+            config.num_key_value_heads * self.head_dim,
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
+        self.q_proj = nn.Linear(config.hidden_size, self.qkv_sizes[0], bias=config.attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.qkv_sizes[1], bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.qkv_sizes[2], bias=config.attention_bias)
+        self.register_module("qkv_proj", None)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.output_bias)
         self.use_qk_norm = config.use_qk_norm
         self.qk_norm_type = config.qk_norm_type
@@ -87,9 +196,12 @@ class FlashAttention(nn.Module):
 
         self._flash_attn_version = flash_attn_version
         self.func = self._funcs[flash_attn_version]
-        self._flash_attn_call = self.func
-        if self._flash_attn_version == 4:
-            self._flash_attn_call = torch._dynamo.disable(self.func)
+
+    def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Query, key and value projections, from one packed GEMM when qkv is fused."""
+        if self.qkv_proj is None:
+            return self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+        return self.qkv_proj(hidden_states).split(self.qkv_sizes, dim=-1)
 
     def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens, max_seqlen):
         """Run the flash attention kernel. q/k/v are [total_tokens, heads, dim]."""
@@ -102,35 +214,22 @@ class FlashAttention(nn.Module):
             # so cu_seqlens must be passed as keyword args to avoid misalignment.
             kwargs["cu_seqlens_q"] = cu_seqlens
             kwargs["cu_seqlens_k"] = cu_seqlens
-            out = self._flash_attn_call(q, k, v, **kwargs)
+            out, _ = self.func(q, k, v, **kwargs)
         else:
-            out = self._flash_attn_call(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, **kwargs)
-        if isinstance(out, tuple):
-            out = out[0]
+            out = self.func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, **kwargs)
         return out
 
-    def _attention_core(
-        self,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        cu_seqlens: torch.LongTensor | None = None,
-        max_seqlen: int | None = None,
-    ) -> torch.Tensor:
-        out = self._compute_attention(query_states[0], key_states[0], value_states[0], cu_seqlens, max_seqlen)
-        return out.contiguous().view(1, out.shape[0], -1)
-
-    def attn_projections(
+    def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cu_seqlens: torch.LongTensor | None = None,
+        max_seqlen: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states, key_states, value_states = self.project_qkv(hidden_states)
 
         if self.use_qk_norm and self.qk_norm_type == "per_layer":
             query_states = self.q_norm(query_states)
@@ -157,28 +256,9 @@ class FlashAttention(nn.Module):
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
-        return query_states, key_states, value_states
-
-    def output_proj(self, attn_output: torch.Tensor) -> torch.Tensor:
-        return self.o_proj(attn_output)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        cu_seqlens: torch.LongTensor | None = None,
-        max_seqlen: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        query_states, key_states, value_states = self.attn_projections(hidden_states, position_embeddings)
-
-        attn_output = self._attention_core(
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
-        attn_output = self.output_proj(attn_output)
+        out = self._compute_attention(query_states[0], key_states[0], value_states[0], cu_seqlens, max_seqlen)
+        attn_output = out.contiguous().view(1, out.shape[0], -1)
+        attn_output = self.o_proj(attn_output)
         return attn_output, None
 
 
@@ -195,16 +275,7 @@ def substitute_ring_attn(
     attn_impl: str = "flash_attention_2",
 ) -> None:
     """Patch _compute_attention on FlashAttention variants to use ring attention."""
-    from ring_flash_attn import llama3_flash_attn_varlen_func
-
-    from .ring_attn import ring_fa3_varlen_func, ring_fa4_varlen_func
-
-    if attn_impl == "flash_attention_4":
-        ring_func = ring_fa4_varlen_func
-    elif attn_impl == "flash_attention_3":
-        ring_func = ring_fa3_varlen_func
-    else:
-        ring_func = llama3_flash_attn_varlen_func
+    from .ring_attn import ring_varlen_attention
 
     def _ring_compute_attention(self, q, k, v, cu_seqlens, max_seqlen):
         from ring_flash_attn.adapters.hf_adapter import DATA_PARAMS
@@ -214,7 +285,7 @@ def substitute_ring_attn(
         if sliding_window is not None:
             window_size = (sliding_window - 1, 0)
 
-        out = ring_func(
+        out = ring_varlen_attention(
             q,
             k,
             v,
@@ -227,9 +298,8 @@ def substitute_ring_attn(
             window_size=window_size,
             group=process_group,
             heads_k_stride=heads_k_stride,
+            attention_backend=attn_impl,
         )
-        if isinstance(out, tuple):
-            out = out[0]
         return out
 
     FlashAttention._compute_attention = _ring_compute_attention
@@ -238,10 +308,6 @@ def substitute_ring_attn(
 
     AfmoeFlashAttention._compute_attention = _ring_compute_attention
 
-    from prime_rl.trainer.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedFlashAttention
+    from prime_rl.trainer.models.gpt_oss.attention import substitute_gpt_oss_ring_attention
 
-    Qwen3_5MoeGatedFlashAttention._compute_attention = _ring_compute_attention
-
-    from prime_rl.trainer.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedFlashAttention
-
-    Qwen3_5GatedFlashAttention._compute_attention = _ring_compute_attention
+    substitute_gpt_oss_ring_attention(process_group, heads_k_stride)

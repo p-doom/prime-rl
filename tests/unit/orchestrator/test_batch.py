@@ -3,9 +3,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from prime_rl.trainer.batch import pad_micro_batch, prepare_batch, prepare_sample
-from prime_rl.trainer.utils import build_bin_cost
-from prime_rl.transport.types import EncodedTensor, MicroBatch, RoutedExperts, TrainingSample
+from prime_rl.orchestrator.batch import (
+    _is_multimodal_sample,
+    build_bin_cost,
+    pad_micro_batch,
+    prepare_batch,
+    prepare_sample,
+)
+from prime_rl.transports.batch.types import MicroBatch, MMImageRef, MMRefs, RoutedExperts, TrainingSample
 
 
 def _routed_experts(data, dtype=np.uint8):
@@ -15,11 +20,6 @@ def _routed_experts(data, dtype=np.uint8):
         shape=list(routed_experts.shape),
         dtype=str(routed_experts.dtype),
     )
-
-
-def _encoded(arr) -> EncodedTensor:
-    a = np.asarray(arr)
-    return EncodedTensor(data=a.tobytes(), shape=list(a.shape), dtype=str(a.dtype))
 
 
 @pytest.fixture
@@ -104,8 +104,6 @@ def test_prepare_batch_balances_micro_batches_across_workers(
         rollouts=examples,
         seq_len=4,
         num_train_workers=num_train_workers,
-        idxs=[0] * rollout_count,
-        num_loras=1,
         bin_cost=build_bin_cost(None),
     )
 
@@ -132,6 +130,44 @@ def test_prepare_batch_balances_micro_batches_across_workers(
         assert sum(1 for loss_mask in batch.loss_mask if loss_mask) == 0
 
 
+def test_prepare_batch_preserves_branch_identity(make_training_example):
+    examples = []
+    for i in range(5):
+        example = make_training_example()
+        example.trace_id = f"trace-{i}"
+        example.branch_index = i
+        examples.append(example)
+    examples.append(make_training_example())  # no identity -> sentinels
+
+    batches_per_gpu = prepare_batch(
+        rollouts=examples,
+        seq_len=4,
+        num_train_workers=2,
+        bin_cost=build_bin_cost(None),
+        pad_to_multiple_of=8,
+    )
+
+    seen: set[tuple[str, int]] = set()
+    for batch in _flatten_batches(batches_per_gpu):
+        if not _has_loss_tokens(batch):
+            # Dummies are copies of real batches; identity must not survive the copy.
+            assert batch.trace_ids is None and batch.branch_indices is None
+            continue
+        assert len(batch.trace_ids) == len(batch.branch_indices) == len(batch.sequence_lengths)
+        seen.update(zip(batch.trace_ids, batch.branch_indices))
+    assert seen == {(f"trace-{i}", i) for i in range(5)} | {("", -1)}
+
+
+def test_prepare_sample_truncation_keeps_identity():
+    sample = make_sized_training_example(10)
+    sample.trace_id = "trace-x"
+    sample.branch_index = 2
+    micro_batch = prepare_sample(sample, seq_len=4)
+    assert len(micro_batch.input_ids) == 4
+    assert micro_batch.trace_ids == ["trace-x"]
+    assert micro_batch.branch_indices == [2]
+
+
 def test_randomized_packing_invariants():
     rng = np.random.default_rng(0)
 
@@ -147,8 +183,6 @@ def test_randomized_packing_invariants():
             rollouts=examples,
             seq_len=seq_len,
             num_train_workers=num_train_workers,
-            idxs=[0] * len(examples),
-            num_loras=1,
             bin_cost=bin_cost,
         )
         flat_batches = _flatten_batches(batches_per_gpu)
@@ -162,7 +196,6 @@ def test_randomized_packing_invariants():
             assert len(batch.input_ids) <= seq_len
             assert sum(batch.sequence_lengths) == len(batch.input_ids)
             assert batch.seq_lens == batch.sequence_lengths
-            assert sum(batch.lora_num_tokens) == len(batch.input_ids)
             assert len(batch.env_names) == len(batch.input_ids)
 
         for batch in dummy_batches:
@@ -189,8 +222,6 @@ def test_split_to_align_avoids_dummy_micro_batches():
         rollouts=examples,
         seq_len=12,
         num_train_workers=4,
-        idxs=[0] * len(examples),
-        num_loras=1,
         bin_cost=build_bin_cost(None),
     )
 
@@ -205,8 +236,6 @@ def test_pack_first_then_balance_distributes_micro_batches_by_tokens_without_mod
         rollouts=examples,
         seq_len=100,
         num_train_workers=2,
-        idxs=[0] * len(examples),
-        num_loras=1,
         bin_cost=build_bin_cost(None),
     )
 
@@ -221,8 +250,6 @@ def test_flop_aware_balancing_pairs_long_and_short_sequence_workloads():
         rollouts=examples,
         seq_len=32,
         num_train_workers=2,
-        idxs=[0] * len(examples),
-        num_loras=1,
         bin_cost=bin_cost,
     )
 
@@ -238,8 +265,6 @@ def test_flop_aware_split_to_align_splits_heaviest_flop_bin():
         rollouts=examples,
         seq_len=64,
         num_train_workers=4,
-        idxs=[0] * len(examples),
-        num_loras=1,
         bin_cost=build_bin_cost(make_flops_config()),
     )
 
@@ -258,8 +283,6 @@ def test_prepare_batch_packs_different_temperatures(make_training_example):
         rollouts=[example1, example2],
         seq_len=16,
         num_train_workers=1,
-        idxs=[0, 0],
-        num_loras=1,
         bin_cost=build_bin_cost(None),
     )
 
@@ -319,8 +342,6 @@ def test_prepare_batch_packs_mixed_components(make_training_example, streams_on_
         rollouts=[longer, shorter],
         seq_len=16,
         num_train_workers=1,
-        idxs=[0, 0],
-        num_loras=1,
         bin_cost=build_bin_cost(None),
     )
 
@@ -360,8 +381,6 @@ def test_prepare_batch_aligns_ref_logprobs_in_mixed_bins(make_training_example, 
         seq_len=16,
         pad_to_multiple_of=1,
         num_train_workers=1,
-        idxs=[0, 0],
-        num_loras=1,
         bin_cost=build_bin_cost(None),
     )
     flat_batches = _flatten_batches(batches_per_gpu)
@@ -417,12 +436,8 @@ def test_prepare_sample_truncates_routed_experts():
 
 
 def test_prepare_sample_truncates_mm_at_image_boundary():
-    """Truncation never splits an image's placeholder block: it cuts to a whole-image boundary
-    and slices mm_kwargs to match, so image-token count stays == image-embedding count."""
-    # Two 2-token images (patches-per-token = 1): image-pad at indices 1,2 (img0) and 4,5 (img1).
+    """Truncation never splits an image's expanded placeholder block."""
     mm_token_type_ids = [0, 1, 1, 0, 1, 1, 0]
-    pixel_values = np.array([[1.0], [1.0], [2.0], [2.0]], dtype=np.float32)  # img0=1.0, img1=2.0
-    grid = np.array([[1, 2, 1], [1, 2, 1]], dtype=np.int64)
     sample = TrainingSample(
         token_ids=[10, 11, 12, 13, 14, 15, 16],
         mask=[False, False, False, False, False, True, True],
@@ -431,7 +446,12 @@ def test_prepare_sample_truncates_mm_at_image_boundary():
         advantages=[0.0] * 6 + [1.0],
         env_name="test-env",
         mm_token_type_ids=mm_token_type_ids,
-        mm_kwargs={"pixel_values": _encoded(pixel_values), "image_grid_thw": _encoded(grid)},
+        mm_refs=MMRefs(
+            images=[
+                MMImageRef(url="data:image/png;base64,first", offset=1, length=2),
+                MMImageRef(url="data:image/png;base64,second", offset=4, length=2),
+            ]
+        ),
     )
 
     # seq_len=5 falls inside img1 (one of its two placeholders survives) -> drop img1 entirely.
@@ -440,12 +460,8 @@ def test_prepare_sample_truncates_mm_at_image_boundary():
     assert len(mb.mm_token_type_ids) == len(mb.input_ids)
     n_placeholders = sum(1 for t in mb.mm_token_type_ids if t)
     assert n_placeholders == 2  # only img0's two placeholders remain
-    # No mismatch: placeholders == image embeddings, and only img0's pixels are kept.
-    assert mb.mm_kwargs["pixel_values"].shape == [2, 1]
-    assert mb.mm_kwargs["image_grid_thw"].shape == [1, 3]
-    kept = np.frombuffer(bytearray(mb.mm_kwargs["pixel_values"].data), dtype=np.float32)
-    assert kept.tolist() == [1.0, 1.0]
-    assert n_placeholders == mb.mm_kwargs["pixel_values"].shape[0]  # ppt == 1 here
+    assert mb.mm_refs is not None
+    assert [(ref.url, ref.offset, ref.length) for ref in mb.mm_refs.images] == [("data:image/png;base64,first", 1, 2)]
 
 
 def test_prepare_batch_packs_multimodal_with_text():
@@ -457,10 +473,7 @@ def test_prepare_batch_packs_multimodal_with_text():
         advantages=[0.0, 1.0, 1.0],
         env_name="mm-env",
         mm_token_type_ids=[0, 1, 0],
-        mm_kwargs={
-            "pixel_values": _encoded(np.array([[1.0, 2.0]], dtype=np.float32)),
-            "image_grid_thw": _encoded(np.array([[1, 2, 2]], dtype=np.int64)),
-        },
+        mm_refs=MMRefs(images=[MMImageRef(url="data:image/png;base64,image", offset=1, length=1)]),
     )
     text_sample = TrainingSample(
         token_ids=[20, 21],
@@ -474,9 +487,7 @@ def test_prepare_batch_packs_multimodal_with_text():
     batches_per_gpu = prepare_batch(
         rollouts=[mm_sample, text_sample],
         seq_len=8,
-        num_train_workers=2,
-        idxs=[0, 0],
-        num_loras=1,
+        num_train_workers=1,
         bin_cost=build_bin_cost(None),
     )
 
@@ -487,10 +498,34 @@ def test_prepare_batch_packs_multimodal_with_text():
     assert batch.sequence_lengths == [3, 2]
     assert batch.position_ids == [0, 1, 2, 0, 1]
     assert batch.mm_token_type_ids == [0, 1, 0, 0, 0]
-    assert batch.mm_kwargs is not None
-    assert batch.mm_kwargs["pixel_values"].shape == [1, 2]
-    assert batch.mm_kwargs["image_grid_thw"].shape == [1, 3]
+    assert batch.mm_refs is not None
+    assert [(ref.offset, ref.length) for ref in batch.mm_refs.images] == [(1, 1)]
     assert batch.env_names == ["mm-env"] * 3 + ["text-env"] * 2
+
+
+def test_split_to_align_splits_multimodal_bins():
+    def make_mm_sample(token: int) -> TrainingSample:
+        return TrainingSample(
+            token_ids=[token, token + 1, token + 2],
+            mask=[False, True, True],
+            logprobs=[0.0, -0.1, -0.2],
+            temperatures=[1.0, 1.0, 1.0],
+            advantages=[0.0, 1.0, 1.0],
+            env_name=f"mm-{token}",
+            mm_token_type_ids=[0, 1, 0],
+            mm_refs=MMRefs(images=[MMImageRef(url=f"data:image/png;base64,{token}", offset=1, length=1)]),
+        )
+
+    batches_per_gpu = prepare_batch(
+        rollouts=[make_mm_sample(10), make_mm_sample(20)],
+        seq_len=8,
+        num_train_workers=2,
+        bin_cost=build_bin_cost(None),
+    )
+
+    batches = _flatten_batches(batches_per_gpu)
+    assert len(batches) == 2
+    assert all(_has_loss_tokens(batch) and _is_multimodal_sample(batch) for batch in batches)
 
 
 def test_prepare_sample_none_routed_experts():

@@ -10,16 +10,18 @@ seq_len = 2048
 [model]
 name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
 
-[wandb]
+[monitors.wandb]
 project = "algorithms-debug"
 name = "debug-self-distill"
 
 [orchestrator]
 batch_size = 32
+
+[orchestrator.train]
 group_size = 1
 
 # reverse-text's demo lives in the "answer" column.
-[orchestrator.algo]
+[orchestrator.train.algo]
 type = "opsd"
 demo_key = "answer"
 
@@ -31,37 +33,29 @@ max_completion_tokens = 128
 
 [[orchestrator.train.source]]
 name = "reverse-text"
-
-[orchestrator.train.source.env.taskset]
-id = "reverse-text-v1"
-
-[orchestrator.train.source.env.agent.harness]
-id = "null"
-
-[orchestrator.train.source.env.agent.runtime]
-type = "subprocess"
+env.taskset.id = "reverse-text"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [orchestrator.eval]
 interval = 1
-num_examples = 128
+
+[orchestrator.eval.select]
+limit = 128
 
 [orchestrator.eval.sampling]
 max_completion_tokens = 128
 
 [[orchestrator.eval.source]]
 name = "reverse-text"
-
-[orchestrator.eval.source.env.taskset]
-id = "reverse-text-v1"
-
-[orchestrator.eval.source.env.agent.harness]
-id = "null"
-
-[orchestrator.eval.source.env.agent.runtime]
-type = "subprocess"
+env.taskset.id = "reverse-text"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [trainer.optim]
 lr = 3e-6
 
 [inference]
+
+[inference.vllm]
 gpu_memory_utilization = 0.5

@@ -34,8 +34,42 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  authorize:
+    name: Authorize dispatcher
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require maintain or admin
+        # Gate MANUAL dispatches only; other events (e.g. release) are
+        # already privileged and pass through. Guard the step, not the job —
+        # a skipped job would skip `prepare` via `needs: authorize`.
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.triggering_actor }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Restricted to repo members with maintain or admin. Automated
+          # in-repo dispatches (devx_tag dev-image builds, the release build)
+          # run as github-actions[bot] via GITHUB_TOKEN — allow those through.
+          if [ "$ACTOR" = "github-actions[bot]" ]; then
+            echo "Dispatcher is repo automation ($ACTOR); allowed."
+            exit 0
+          fi
+          role=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.role_name' 2>/dev/null || true)
+          echo "Dispatcher $ACTOR has repo role: ${role:-<none>}"
+          case "$role" in
+            admin|maintain)
+              echo "Authorized." ;;
+            *)
+              echo "::error::$ACTOR (role: ${role:-none}) is not allowed to trigger image builds; requires maintain or admin." >&2
+              exit 1 ;;
+          esac
+
   prepare:
     name: Prepare build
+    needs: authorize
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -69,7 +103,7 @@ jobs:
           esac
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.BUILD_REF }}
           fetch-depth: 0
@@ -81,27 +115,30 @@ jobs:
           INPUT_TAG: ${{ env.BUILD_TAG }}
           PLATFORMS: ${{ env.BUILD_PLATFORMS }}
         run: |
-          case "$INPUT_REF" in
-            main|v[0-9]*|*.dev[0-9]*) ;;
-            *)
-              echo "ref '${INPUT_REF}' not allowed for ghcr publish (must be main, v*, or *.dev*)" >&2
-              exit 1
-              ;;
-          esac
-
           if [ -n "$INPUT_TAG" ] && [ "$INPUT_TAG" != "$INPUT_REF" ] && [ "$INPUT_REF" != "main" ]; then
             echo "custom 'tag' that differs from 'ref' is only allowed when ref=main; got ref='${INPUT_REF}' tag='${INPUT_TAG}'" >&2
             exit 1
           fi
 
-          raw_tag="$INPUT_TAG"
-          if [ -z "$raw_tag" ]; then
-            raw_tag="$INPUT_REF"
+          sanitize() {
+            echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//' | cut -c1-50
+          }
+
+          # A ref that is exactly a git tag builds under that tag verbatim;
+          # any other ref (branch / arbitrary commit) is prefixed with
+          # `git describe` so the tag carries the nearest release, commit
+          # distance and short sha (e.g. v0.7.0-42-g1a2b3c4d5-fix-my-branch)
+          # and can't collide with a clean release tag.
+          if [ -n "$INPUT_TAG" ]; then
+            tag=$(sanitize "$INPUT_TAG")
+          elif tag=$(git describe --tags --exact-match 2>/dev/null); then
+            :
+          else
+            tag="$(git describe --tags --always)-$(sanitize "$INPUT_REF")"
           fi
 
-          tag=$(echo "$raw_tag" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | sed 's/--*/-/g' | cut -c1-50 | sed 's/^-//;s/-$//')
           if [ -z "$tag" ]; then
-            echo "Could not derive a valid image tag from '${raw_tag}'." >&2
+            echo "Could not derive a valid image tag from ref='${INPUT_REF}' tag='${INPUT_TAG}'." >&2
             exit 1
           fi
 
@@ -124,12 +161,18 @@ jobs:
     steps:
       - name: Remove unnecessary packages
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          # Deleting the preinstalled toolchains costs ~70s; skip unless disk is tight.
+          avail_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "${avail_gb:-0}" -lt 80 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          else
+            echo "Skipping cleanup: ${avail_gb}G available on /"
+          fi
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
-          ref: ${{ needs.prepare.outputs.ref }}
+          ref: ${{ needs.prepare.outputs.full_sha }}
           fetch-depth: 0
           submodules: false
 
@@ -137,7 +180,7 @@ jobs:
         run: |
           if [ -f .gitmodules ]; then
             git config --global url."https://github.com/".insteadOf "git@github.com:"
-            git submodule update --init --recursive -- deps/pydantic-config deps/verifiers deps/renderers deps/research-environments
+            git submodule update --init --recursive -- deps/pydantic-config deps/verifiers deps/renderers deps/prime-envs
           fi
 
       - name: Log in to GitHub Container Registry
@@ -150,13 +193,55 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.9"
+          enable-cache: false
+
+      - name: Resolve dependency image and package versions
+        id: dependency
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          set -euo pipefail
+          key=$(uv run --no-project --python 3.12 scripts/docker_dependencies.py fingerprint .)
+          image="${REGISTRY}/${IMAGE_NAME}:deps-${key}-${SUFFIX}"
+          digest=$(uv run --no-project --python 3.12 scripts/docker_dependencies.py resolve "$image")
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          bash scripts/docker-editable-pretend-versions.sh --github-output . >> "$GITHUB_OUTPUT"
+
+      - name: Build and push dependencies
+        id: dependencies
+        if: steps.dependency.outputs.digest == ''
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile.cuda
+          target: dependencies
+          outputs: type=image,push=true,compression=zstd,compression-level=3
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dependency-buildcache-${{ matrix.suffix }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dependency-buildcache-${{ matrix.suffix }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=3
+          platforms: ${{ matrix.platform }}
+          tags: ${{ steps.dependency.outputs.image }}
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile.cuda
-          push: true
+          target: runtime
+          build-args: |
+            DEPENDENCY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.dependencies.outputs.digest || steps.dependency.outputs.digest }}
+            VERIFIERS_PRETEND_VERSION=${{ steps.dependency.outputs.verifiers }}
+            RENDERERS_PRETEND_VERSION=${{ steps.dependency.outputs.renderers }}
+            PYDANTIC_CONFIG_PRETEND_VERSION=${{ steps.dependency.outputs.pydantic_config }}
+          outputs: type=image,push=true,compression=zstd,compression-level=3
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:application-buildcache-${{ matrix.suffix }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:application-buildcache-${{ matrix.suffix }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,compression-level=3
           platforms: ${{ matrix.platform }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.tag }}-${{ matrix.suffix }}
@@ -172,6 +257,8 @@ jobs:
           IMAGE_TAG: ${{ needs.prepare.outputs.tag }}
           IMAGE_SHA: ${{ needs.prepare.outputs.sha }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          DEPENDENCY_IMAGE: ${{ steps.dependency.outputs.image }}
+          DEPENDENCY_DIGEST: ${{ steps.dependencies.outputs.digest || steps.dependency.outputs.digest }}
           PLATFORM: ${{ matrix.platform }}
           SUFFIX: ${{ matrix.suffix }}
         run: |
@@ -185,6 +272,7 @@ jobs:
             echo "| **Image** | \`${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}-${SUFFIX}\` |"
             echo "| **Commit** | \`${IMAGE_SHA}\` |"
             echo "| **Digest** | \`${IMAGE_DIGEST}\` |"
+            echo "| **Dependencies** | \`${DEPENDENCY_IMAGE}@${DEPENDENCY_DIGEST}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   manifest:

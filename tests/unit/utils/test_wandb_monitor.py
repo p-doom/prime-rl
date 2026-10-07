@@ -1,28 +1,19 @@
-from prime_rl.configs.trainer import BaseOptimizerConfig
-from prime_rl.utils.monitor.wandb import _run_config_payload
+from prime_rl.monitors.wandb.monitor import _run_config_payload
+from prime_rl.utils.config import BaseConfig
+
+
+class _OptimizerConfig(BaseConfig):
+    lr: float = 1e-6
+    max_norm: float = 1.0
 
 
 def test_shared_run_config_is_namespaced_by_writer_label():
-    run_config = BaseOptimizerConfig(lr=1e-6)
+    payload = _run_config_payload(_OptimizerConfig(), shared_mode=True, label="trainer")
 
-    payload = _run_config_payload(run_config, shared_mode=True, label="trainer")
-
-    assert payload == {
-        "trainer": {
-            "lr": 1e-6,
-            "weight_decay": 0.01,
-            "max_norm": 1.0,
-        }
-    }
+    assert payload == {"trainer": {"lr": 1e-6, "max_norm": 1.0}}
 
 
 def test_non_shared_run_config_remains_unnamespaced():
-    run_config = BaseOptimizerConfig(lr=1e-6)
+    payload = _run_config_payload(_OptimizerConfig(), shared_mode=False, label=None)
 
-    payload = _run_config_payload(run_config, shared_mode=False, label=None)
-
-    assert payload == {
-        "lr": 1e-6,
-        "weight_decay": 0.01,
-        "max_norm": 1.0,
-    }
+    assert payload == {"lr": 1e-6, "max_norm": 1.0}

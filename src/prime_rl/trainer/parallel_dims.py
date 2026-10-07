@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from dataclasses import dataclass
 from functools import cached_property
 
@@ -25,7 +26,7 @@ from torch._utils import _get_available_device_type
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from prime_rl.configs.trainer import ModelConfig
-from prime_rl.utils.logger import get_logger
+from prime_rl.utils.logger import format_time, get_logger
 
 device_type = _get_available_device_type() or "cuda"
 
@@ -74,10 +75,9 @@ class ParallelDims:
             assert ep % cp == 0 and (dp_shard * cp) % ep == 0
 
     def build_mesh(self) -> DeviceMesh:
-        if self.ep > 1:
-            return self._build_mesh_with_ep()
-        else:
-            return self._build_mesh_without_ep()
+        mesh = self._build_mesh_with_ep() if self.ep > 1 else self._build_mesh_without_ep()
+        self._submeshes["head"] = self._submeshes["dp_shard_cp"]
+        return mesh
 
     def _build_mesh_with_ep(self) -> DeviceMesh:
         # With ep, dp_shard and ep are derived submeshes:
@@ -95,17 +95,20 @@ class ParallelDims:
                 dp_shard_mod_ep,
                 dp_shard_in_ep,
                 self.cp,
+                1,
             ],
-            ["pp", "dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "cp"],
+            ["pp", "dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "cp", "dp_shard_mod_head"],
         ):
             # dp_shard_mod_ep is needed even if it's 1, whose FSDP wrapping
             # helps the MoE layers do mixed precision training
-            if d > 1 or name == "dp_shard_mod_ep":
+            if d > 1 or name in ("dp_shard_mod_ep", "dp_shard_mod_head"):
                 dims.append(d)
                 names.append(name)
 
         self.logger.info(f"Building {len(dims)}-D device mesh with {names}, {dims}")
+        t0 = time.perf_counter()
         mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
+        self.logger.debug(f"Built device mesh in {format_time(time.perf_counter() - t0)}")
 
         # Create all the submesh here to ensure all required process groups are
         # initialized:
@@ -155,15 +158,17 @@ class ParallelDims:
         dims = []
         names = []
         for d, name in zip(
-            [self.pp, self.dp_replicate, self.dp_shard, self.cp],
-            ["pp", "dp_replicate", "dp_shard", "cp"],
+            [self.pp, self.dp_replicate, self.dp_shard, self.cp, 1],
+            ["pp", "dp_replicate", "dp_shard", "cp", "dp_shard_mod_head"],
         ):
-            if d > 1 or name == "dp_shard":
+            if d > 1 or name == "dp_shard" or (name == "dp_shard_mod_head" and self.dp_shard * self.cp > 1):
                 dims.append(d)
                 names.append(name)
 
         self.logger.info(f"Building {len(dims)}-D device mesh with {names}, {dims}")
+        t0 = time.perf_counter()
         mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
+        self.logger.debug(f"Built device mesh in {format_time(time.perf_counter() - t0)}")
 
         # Create all the submesh here to ensure all required process groups are
         # initialized:
@@ -275,6 +280,7 @@ def _is_moe_model(config: ModelConfig) -> bool:
     from transformers import AutoConfig
 
     model_config = AutoConfig.from_pretrained(config.name, trust_remote_code=config.trust_remote_code)
+    model_config = getattr(model_config, "text_config", model_config)
     return hasattr(model_config, "num_experts") or hasattr(model_config, "n_routed_experts")
 
 
@@ -286,12 +292,6 @@ def resolve_ep(config: ModelConfig) -> None:
     models, resolves to 1 (no-op).
     """
     if config.ep != "auto":
-        return
-
-    # EP requires the custom implementation; skip auto-resolution for HF impl
-    if config.impl not in ("custom", "auto"):
-        config.ep = 1
-        get_logger().info(f"EP auto: impl='{config.impl}' does not support EP, resolving ep=1")
         return
 
     world_size = dist.get_world_size()
@@ -307,13 +307,6 @@ def resolve_ep(config: ModelConfig) -> None:
 
     config.ep = resolved_ep
     get_logger().info(f"EP auto: world_size={world_size}, dp_replicate={dp_replicate} -> resolved ep={resolved_ep}")
-
-    if config.ep_comm_backend != "torch" and config.ep <= 1:
-        raise ValueError(
-            f"model.ep_comm_backend='{config.ep_comm_backend}' requires ep > 1, "
-            f"but auto-resolved ep=1 (world_size={world_size}). "
-            "Set ep explicitly or use ep_comm_backend='torch'."
-        )
 
 
 def get_parallel_dims(config: ModelConfig, seq_len: int | None = None) -> ParallelDims:

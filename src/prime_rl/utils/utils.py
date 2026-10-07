@@ -1,35 +1,14 @@
 import asyncio
 import functools
 import importlib
-import os
+import math
 import sys
-from collections import defaultdict
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Callable
 
-import torch
-import torch.distributed as dist
 import wandb
 
 from prime_rl.utils.logger import get_logger
-
-# TODO: Change all imports to use utils.pathing
-# ruff: noqa: F401
-from prime_rl.utils.pathing import (
-    get_all_ckpt_steps,
-    get_broadcast_dir,
-    get_ckpt_dir,
-    get_eval_dir,
-    get_log_dir,
-    get_rollout_dir,
-    get_stable_ckpt_steps,
-    get_step_path,
-    get_weights_dir,
-    resolve_latest_ckpt_step,
-    sync_wait_for_path,
-    wait_for_path,
-)
 
 
 def import_object(dotted_path: str) -> Any:
@@ -39,10 +18,17 @@ def import_object(dotted_path: str) -> Any:
     return getattr(module, name)
 
 
+def destroy_process_group() -> None:
+    dist = sys.modules.get("torch.distributed")
+    if dist is not None and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def clean_exit(func: Callable) -> Callable:
     """
     A decorator that ensures the a torch.distributed process group is properly
-    cleaned up after the decorated function runs or raises an exception.
+    cleaned up after the decorated function runs or raises an exception. Torch is
+    looked up lazily: a process that never imported it (eval) has no group.
     """
     if asyncio.iscoroutinefunction(func):
 
@@ -60,8 +46,7 @@ def clean_exit(func: Callable) -> Callable:
                 # the event loop swallows it and the process hangs indefinitely.
                 sys.exit(1)
             finally:
-                if dist.is_initialized():
-                    dist.destroy_process_group()
+                destroy_process_group()
 
         return async_wrapper
     else:
@@ -78,34 +63,9 @@ def clean_exit(func: Callable) -> Callable:
                 # sys.exit raises SystemExit so the finally block still runs.
                 sys.exit(1)
             finally:
-                if dist.is_initialized():
-                    dist.destroy_process_group()
+                destroy_process_group()
 
         return sync_wrapper
-
-
-def to_col_format(list_of_dicts: list[dict[str, Any]]) -> dict[str, list[Any]]:
-    """
-    Turns a list of dicts to a dict of lists.
-
-    Example:
-
-    ```python
-    list_of_dicts = [{"a": 1, "b": 2}, {"a": 3, "b": 4}] # Row format
-    to_col_format(list_of_dicts)
-    ```
-
-    Returns:
-
-    ```python
-    {"a": [1, 3], "b": [2, 4]} # Column format
-    ```
-    """
-    dict_of_lists = defaultdict(list)
-    for row in list_of_dicts:
-        for key, value in row.items():
-            dict_of_lists[key].append(value)
-    return dict(dict_of_lists)
 
 
 def format_time(time_s: float) -> str:
@@ -152,6 +112,31 @@ def format_num(num: float | int, precision: int = 2) -> str:
         return f"{sign}{num / 1e9:.{precision}f}B"
 
 
+def sanitize(obj: Any) -> tuple[Any, list[str]]:
+    """Recursively drop non-finite floats (NaN/inf), which are not valid JSON.
+    Returns the sanitized object and the dotted paths of the dropped values."""
+    dropped_paths: list[str] = []
+
+    def keep(item: Any, path: str) -> bool:
+        if isinstance(item, float) and not math.isfinite(item):
+            dropped_paths.append(path)
+            return False
+        return True
+
+    def walk(value: Any, path: str) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: walk(item, child)
+                for key, item in value.items()
+                if keep(item, child := f"{path}.{key}" if path else key)
+            }
+        if isinstance(value, list):
+            return [walk(item, child) for index, item in enumerate(value) if keep(item, child := f"{path}[{index}]")]
+        return value
+
+    return walk(obj, ""), dropped_paths
+
+
 def get_free_port() -> int:
     """Find and return a free port"""
     import socket
@@ -163,19 +148,10 @@ def get_free_port() -> int:
     return port
 
 
-def get_latest_ckpt_step(weights_dir: Path) -> int | None:
-    step_dirs = list(weights_dir.glob("step_*"))
-    if len(step_dirs) == 0:
-        return None
-    steps = sorted([int(step_dir.name.split("_")[-1]) for step_dir in step_dirs])
-    for latest_step in steps[::-1]:
-        if Path(weights_dir / f"step_{latest_step}" / "STABLE").exists():
-            return latest_step
-    return None
-
-
 @contextmanager
 def default_dtype(dtype):
+    import torch
+
     prev = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:

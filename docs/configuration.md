@@ -2,7 +2,7 @@
 
 Every `prime-rl` entrypoint uses [`pydantic-config`](https://github.com/PrimeIntellect-ai/pydantic-config): TOML files for reproducible base configs, CLI flags for one-off overrides.
 
-> **AI agents working in this repo:** the equivalent runbook is at [`skills/configs/SKILL.md`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/skills/configs/SKILL.md), with extra runtime hints (where config classes live, validator conventions, the trainer-side `enable_token_export` flag) that aren't surfaced here.
+> **AI agents working in this repo:** the equivalent runbook is at [`skills/configs/SKILL.md`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/skills/configs/SKILL.md), with extra runtime hints (where config classes live, validator conventions) that aren't surfaced here.
 
 ## Table of Contents
 
@@ -50,7 +50,7 @@ CLI flags mirror the TOML tree using dots:
 --max-steps 50                              # top-level
 --model.name Qwen/Qwen3-4B                  # nested
 --trainer.optim.lr 1e-5                     # double-nested
---inference.parallel.tp 4
+--inference.vllm.tensor-parallel-size 4
 ```
 
 > Field names are snake_case in TOML (`max_model_len`) and kebab-case on the CLI (`--max-model-len`).
@@ -61,7 +61,7 @@ CLI flags mirror the TOML tree using dots:
 
 ```bash
 uv run rl --help                                       # full schema
-uv run rl @ rl.toml --dry-run --output-dir /tmp/check  # write resolved configs
+uv run rl @ rl.toml --dry-run --output-dir /tmp --run.name check  # write resolved configs (JSON) to /tmp/check/configs
 ```
 
 ## Syntax
@@ -71,12 +71,12 @@ uv run rl @ rl.toml --dry-run --output-dir /tmp/check  # write resolved configs
 CLI uses paired flags: bare `--flag` sets `True`, `--no-flag` sets `False`. TOML must be explicit:
 
 ```bash
-uv run rl @ rl.toml --clean-output-dir       # True
-uv run rl @ rl.toml --no-clean-output-dir    # False
+uv run rl @ rl.toml --clean       # True
+uv run rl @ rl.toml --no-clean    # False
 ```
 
 ```toml
-clean_output_dir = true
+clean = true
 ```
 
 ### Lists
@@ -106,10 +106,8 @@ uv run rl @ rl.toml --orchestrator.train.source.0.args \
 
 ```toml
 [[orchestrator.train.source]]
-
-[orchestrator.train.source.args]
-dataset_name = "openai/gsm8k"
-dataset_subset = "main"
+args.dataset_name = "openai/gsm8k"
+args.dataset_subset = "main"
 ```
 
 ### Optional Sub-Configs
@@ -126,11 +124,11 @@ To **disable** a sub-config that's on by default, use `--no-<name>` on the CLI o
 TOML has no `null`. Use the string `"None"`, which the loader coerces:
 
 ```toml
-[inference.model]
+[inference.vllm]
 max_model_len = "None"
 ```
 
-On the CLI: `--inference.model.max-model-len None`.
+On the CLI: `--inference.vllm.max-model-len None`.
 
 ### Discriminated Unions
 
@@ -153,45 +151,53 @@ Training and evaluation sources are arrays of tables. Set one source per environ
 [[orchestrator.train.source]]
 name = "gsm8k"
 ratio = 3  # 75% of batches
-
-[orchestrator.train.source.env.taskset]
-id = "gsm8k-v1"
-split = "train"
-
-[orchestrator.train.source.env.agent.harness]
-id = "null"
-
-[orchestrator.train.source.env.agent.runtime]
-type = "subprocess"
+env.taskset.id = "gsm8k"
+env.taskset.split = "train"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [[orchestrator.train.source]]
 name = "reverse-text"
 ratio = 1  # default — 25% of batches
-
-[orchestrator.train.source.env.taskset]
-id = "reverse-text-v1"
-
-[orchestrator.train.source.env.agent.harness]
-id = "null"
-
-[orchestrator.train.source.env.agent.runtime]
-type = "subprocess"
+env.taskset.id = "reverse-text"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [[orchestrator.eval.source]]
 name = "gsm8k-eval"
-
-[orchestrator.eval.source.env.taskset]
-id = "gsm8k-v1"
-split = "test"
-
-[orchestrator.eval.source.env.agent.harness]
-id = "null"
-
-[orchestrator.eval.source.env.agent.runtime]
-type = "subprocess"
+env.taskset.id = "gsm8k"
+env.taskset.split = "test"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 ```
 
-`ratio` defaults to `1` (equal weight per env); values are relative weights normalized to probabilities across envs.
+Each source group — `[orchestrator.train]`, `[orchestrator.eval]`, the `[eval]` block of `sft` and the top level of `eval` — holds defaults for its sources. Every field that a group and its sources both have is a default: `env`, `sampling`, `select` and `group_size`, plus `algo` on the train group and `interval` on the eval groups of a training run. Each source inherits the fields that its group sets. One rule applies to all of them: nested blocks merge key by key, a source's own values win, and a block whose `type` (e.g. of `algo`) differs from the group's is the source's alone.
+
+```toml
+[orchestrator.train]
+group_size = 16
+
+[orchestrator.train.algo]
+type = "grpo"
+
+[[orchestrator.train.source]]
+env.taskset.id = "math"
+group_size = 32  # this source's own value wins over the group's 16
+
+[orchestrator.eval.env]
+retries.rules = [
+  {type = "ProviderError", max_retries = 3},
+  {type = "SandboxError", max_retries = 3},
+]
+timeout.episode = 7200
+
+[orchestrator.eval.select]  # evaluate 128 tasks of each taskset
+limit = 128
+```
+
+The group `env` block holds only the knobs that every env and taskset has: `retries`, `timeout`, `max_concurrent_agents`, `interception`, and `taskset.task` and `taskset.system_prompt`. Ids and agents stay on each source. `select` picks which tasks of a source's taskset run: `include`/`exclude` by task `idx`/`ids`/`keys`/`names`, then `shuffle`, `skip` and `limit`, in that order.
+
+`ratio` is a training-source field: it defaults to `1` (equal weight per env), and values are relative weights normalized to probabilities across envs. Eval sources of a training run carry `interval` instead, the step interval at which they fire; a standalone eval has neither.
 
 Everything environment lives under the `env` block (verifiers' `[env]` shape): `env.taskset` configures the v1 taskset, and each agent is a field on the env — `env.agent.harness` selects how the single-agent env's tasks are run, and per-run caps are per-agent (`env.agent.max_turns`, `env.agent.timeout`, `env.agent.max_output_tokens`). A multi-agent env declares its own seats (`env.<role>.*`).
 
@@ -218,7 +224,7 @@ PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:False"
 VLLM_USE_DEEP_GEMM = "1"
 
 [orchestrator.env_vars]
-PI_USAGE_BASE_URL = "https://..."
+PRIME_LOG_LEVEL = "debug"
 ```
 
 The `rl` launcher applies these the same way in both single-node and multi-node (SLURM) runs. Precedence, low to high:
@@ -240,16 +246,16 @@ The shipped end-to-end examples in [`examples/`](https://github.com/PrimeIntelle
 - [**Wordle**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/wordle) — `Qwen3-1.7B` playing Wordle. Multi-turn SFT + RL; 2–4 H100s.
 - [**Alphabet Sort**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/alphabet-sort) — `Qwen3-4B-Instruct-2507` sorting names alphabetically. Multi-turn LoRA RL without SFT warmup; one H100.
 - [**Wiki Search**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/wiki-search) — `Qwen3-4B-Instruct-2507` answering trivia by searching a Wikipedia corpus. Multi-turn with tool use.
-- [**Hendrycks Sanity**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/hendrycks-sanity) — `DeepSeek-R1-Distill-Qwen-1.5B` on a filtered MATH subset. Useful for algorithm ablations.
+- [**Hendrycks Sanity**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/hendrycks-sanity) — `Qwen3-1.7B` on a filtered MATH subset. Useful for algorithm ablations.
 
 **Advanced** (32–2048 GPUs, SLURM):
 
 - [**Qwen3-30B-A3B**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/qwen3-30b-a3b) — `Qwen3-30B-A3B` on math, SWE, and tool use.
-- [**GLM-4.5-Air**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/glm-4.5-air) — `GLM-4.5-Air` on search, SWE, and terminal.
-- [**Nemotron-3-Super**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/nemotron-3-super) — `Nemotron-3-Super-120B` hybrid-Mamba MoE on SWE at 131k context.
-- [**MiniMax-M2.5 SWE**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/minimax-m2.5) — `MiniMax-M2.5` on agentic SWE.
+- [**GLM-4.5-Air**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/glm-4.5-air) — `GLM-4.5-Air` on search, SWE, and terminal; includes a variant that trains the 100B+ MoE on only two nodes.
+- [**Nemotron-3-Super**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/configs/advanced/nemotron-3-super) — `Nemotron-3-Super-120B` hybrid-Mamba MoE on SWE at 131k context.
+- [**MiniMax-M2.5 SWE**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/configs/advanced/minimax-m2.5) — `MiniMax-M2.5` on agentic SWE.
 - [**INTELLECT-3.1**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/intellect-3.1) — reproduces our INTELLECT-3.1 training run.
-- [**High-throughput GLM-5**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/glm-5.2) — large-scale `GLM-5`/`GLM-5.2` inference with P/D disaggregation and FP8.
+- [**High-throughput GLM-5**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/glm-5.3) — large-scale `GLM-5`/`GLM-5.3` inference with P/D disaggregation and FP8.
 
 ### Worked Example: Compose, Override, Dry-Run
 
@@ -257,17 +263,24 @@ Start from a shipped base config, override two fields on the CLI, and dry-run:
 
 ```bash
 uv run rl @ examples/basic/reverse-text/rl.toml \
-  --wandb.name my-experiment \
+  --monitors.wandb.name my-experiment \
   --trainer.optim.lr 5e-6 \
   --output-dir /tmp/reverse-dry \
+  --run.name check \
   --dry-run
 ```
 
 Then inspect the resolved config:
 
 ```bash
-ls /tmp/reverse-dry/configs/
-# rl.toml  trainer.toml  orchestrator.toml  inference.toml
+ls /tmp/reverse-dry/check/configs/latest/resolved/
+# rl.json  trainer.json  orchestrator.json  inference.json
 ```
 
-Each per-process TOML reflects the final, validated configuration that the actual run would consume — exactly what each process sees when started standalone (`uv run trainer @ /tmp/reverse-dry/configs/trainer.toml`, etc.). This is the easiest way to bisect a misbehaving config: dry-run a known-good base, dry-run your overlay, diff the two.
+Each per-process JSON contains the final, validated configuration that the run
+uses. This is also what each standalone process reads. For example, the trainer
+reads `configs/latest/resolved/trainer.json`.
+
+`configs/latest/command.txt` records the shell-safe launch command and its CLI
+overrides. Each launch also remains under `configs/attempt_<n>/`. To compare
+configs, dry-run a known-good base and your overlay. Then diff the two attempts.

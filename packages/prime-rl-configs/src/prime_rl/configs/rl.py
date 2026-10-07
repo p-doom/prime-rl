@@ -1,3 +1,4 @@
+import uuid
 import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
@@ -6,52 +7,25 @@ from pydantic import Field, model_validator
 
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.inference import WeightBroadcastConfig as InferenceWeightBroadcastConfig
-from prime_rl.configs.orchestrator import (
-    FileSystemWeightBroadcastConfig as OrchestratorFileSystemWeightBroadcastConfig,
-)
-from prime_rl.configs.orchestrator import (
-    NCCLWeightBroadcastConfig as OrchestratorNCCLWeightBroadcastConfig,
-)
-from prime_rl.configs.orchestrator import (
-    NIXLWeightBroadcastConfig as OrchestratorNIXLWeightBroadcastConfig,
-)
-from prime_rl.configs.orchestrator import (
-    OrchestratorConfig,
-)
+from prime_rl.configs.monitors import FileMonitorConfig, PrimeTrainMonitorConfig
+from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.shared import (
     EnvVars,
-    FileMonitorConfig,
+    FileSystemWeightBroadcastConfig,
+    NCCLWeightBroadcastConfig,
+    ResumeConfig,
+    RunConfig,
     SlurmConfig,
     TransportConfig,
     VLMConfig,
+    WeightBroadcastConfig,
 )
 from prime_rl.configs.trainer import (
-    BenchConfig,
-    FakeDataLoaderConfig,
     TokenizerConfig,
     TrainerConfig,
 )
-from prime_rl.configs.trainer import (
-    FileSystemWeightBroadcastConfig as TrainerFileSystemWeightBroadcastConfig,
-)
-from prime_rl.configs.trainer import (
-    NCCLWeightBroadcastConfig as TrainerNCCLWeightBroadcastConfig,
-)
-from prime_rl.configs.trainer import (
-    NIXLWeightBroadcastConfig as TrainerNIXLWeightBroadcastConfig,
-)
-from prime_rl.utils.config import BaseConfig, find_package_resource
-from prime_rl.utils.validation import (
-    propagate_shared_fields,
-    validate_shared_ckpt_config,
-    validate_shared_max_steps,
-    validate_shared_model_name,
-    validate_shared_output_dir,
-    validate_shared_seq_len,
-    validate_shared_tokenizer,
-    validate_shared_wandb_config,
-    validate_shared_weight_broadcast,
-)
+from prime_rl.utils.config import BaseConfig, default_output_dir, find_package_resource
+from prime_rl.utils.validation import propagate_shared_fields
 
 
 class SharedLogConfig(BaseConfig):
@@ -70,7 +44,7 @@ class SharedWandbConfig(BaseConfig):
     """W&B entity."""
 
     name: str | None = None
-    """W&B run name."""
+    """W&B run name. Inherits ``run.name`` when unset."""
 
     group: str | None = None
     """W&B group."""
@@ -86,11 +60,24 @@ class SharedWandbConfig(BaseConfig):
         if self.offline:
             raise ValueError(
                 "W&B shared mode is always on for the rl entrypoint and requires server "
-                "connectivity; wandb.offline = true is not supported. Use offline mode "
-                "via the sub-config wandb blocks (trainer.wandb.offline, "
-                "orchestrator.wandb.offline) if you really need it per-process."
+                "connectivity; monitors.wandb.offline = true is not supported. Use offline mode "
+                "via the sub-config wandb blocks (trainer.monitors.wandb.offline, "
+                "orchestrator.monitors.wandb.offline) if you really need it per-process."
             )
         return self
+
+
+class SharedMonitorsConfig(BaseConfig):
+    """The ``rl`` entrypoint's shared monitor configs, propagated to trainer and orchestrator."""
+
+    wandb: SharedWandbConfig | None = None
+    """Shared W&B config. Propagated to trainer and orchestrator."""
+
+    file: FileMonitorConfig | None = None
+    """Shared local JSONL metric sink. If set, enables ``<output_dir>/monitors/file/metrics.jsonl`` on both trainer and orchestrator."""
+
+    prime: PrimeTrainMonitorConfig | None = None
+    """Prime platform monitor. Propagated to the orchestrator only — the trainer has no platform integration."""
 
 
 class SharedCheckpointConfig(BaseConfig):
@@ -99,9 +86,6 @@ class SharedCheckpointConfig(BaseConfig):
 
     interval: int | None = None
     """Interval at which to save checkpoints."""
-
-    resume_step: int | None = None
-    """Step to resume from. If None, does not resume from a checkpoint."""
 
     keep_last: int | None = Field(None, ge=1)
     """Keep at most this many recent step checkpoints on disk. If None, never clean old checkpoints based on recency."""
@@ -116,47 +100,6 @@ class SharedModelConfig(BaseConfig):
 
     vlm: "VLMConfig | None" = None
     """VLM configuration. Set this to enable vision-language model support."""
-
-
-class SharedInMemoryWeightBroadcastConfig(BaseConfig):
-    host: str = "localhost"
-    """Weight transfer host."""
-
-    port: int
-    """Weight transfer port."""
-
-    timeout: int = 1200
-    """Timeout in seconds for in-memory weight transfer."""
-
-
-class SharedNCCLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
-    type: Literal["nccl"] = "nccl"
-
-    port: int = 29501
-    """Port for NCCL weight broadcast."""
-
-    quantize_in_weight_transfer: bool = False
-    """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
-
-
-class SharedNIXLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
-    type: Literal["nixl"] = "nixl"
-
-    port: int = 8001
-    """ModelExpress gRPC port."""
-
-    session_id: str = "default"
-    """ModelExpress session ID."""
-
-
-class SharedFileSystemWeightBroadcastConfig(BaseConfig):
-    type: Literal["filesystem"] = "filesystem"
-
-
-SharedWeightBroadcastConfig: TypeAlias = Annotated[
-    SharedFileSystemWeightBroadcastConfig | SharedNCCLWeightBroadcastConfig | SharedNIXLWeightBroadcastConfig,
-    Field(discriminator="type"),
-]
 
 
 class BaseDeploymentConfig(BaseConfig):
@@ -222,16 +165,34 @@ class RLConfig(BaseConfig):
     orchestrator: OrchestratorConfig
 
     inference: InferenceConfig | None = None
-    """Inference server configuration. If None, the rl entrypoint will not start an inference server (useful for elastic inference pools or manually started servers)."""
+    """Inference server configuration. If None, the rl entrypoint will not start an inference server (useful for manually started servers)."""
 
     env_vars: EnvVars = {}
     """Extra environment variables for every launched RL component. Component-specific env_vars override these."""
 
-    output_dir: Path = Path("outputs")
-    """Output directory. Should be unique per experiment."""
+    run: RunConfig = Field(default_factory=RunConfig)
+    """Run metadata. ``run.name`` names the run directory under ``output_dir``."""
 
-    clean_output_dir: bool = False
-    """Delete the output directory before starting training. Required to overwrite an output directory that contains checkpoints from a previous run when not resuming."""
+    output_dir: Path = Field(default_factory=default_output_dir)
+    """Directory that groups related runs. Each run writes its artifacts to ``output_dir / run.name``. Defaults to ``$PRL_OUTPUT_DIR`` if set, else ``outputs``."""
+
+    clean: bool = False
+    """Delete the run directory (``output_dir / run.name``) before starting training. Required to overwrite a run directory that contains artifacts from a previous run when not resuming."""
+
+    @property
+    def run_dir(self) -> Path:
+        assert self.run.dir is not None  # resolved at construction
+        return self.output_dir / self.run.dir
+
+    def _resolve_run_name(self) -> None:
+        """Fill the auto-generated run name and directory (idempotent — called by every
+        validator that reads them, so it does not depend on validator ordering)."""
+        if self.run.name is None:
+            envs = "+".join(dict.fromkeys(source.resolved_name for source in self.orchestrator.train.source))
+            model = self.trainer.model.name.split("/")[-1]
+            self.run.name = f"{envs or 'no-env'}--{model}--{uuid.uuid4().hex[:8]}".lower()
+        if self.run.dir is None:
+            self.run.dir = self.run.name
 
     ### Shared configurations
 
@@ -241,11 +202,11 @@ class RLConfig(BaseConfig):
     ckpt: SharedCheckpointConfig | None = None
     """Shared checkpoint config. If None, falls back to the sub-config checkpoint settings."""
 
-    wandb: SharedWandbConfig | None = None
-    """Shared W&B config. If None, falls back to the sub-config W&B settings."""
+    resume: ResumeConfig | None = None
+    """Resume the run from a checkpoint (point at it with the previous run's ``run.name``). Without ``[ckpt]`` the run loads the checkpoint but saves no new ones. If None, does not resume."""
 
-    file_monitor: FileMonitorConfig | None = None
-    """Shared local JSONL metric sink. If set, enables ``<output_dir>/metrics.jsonl`` on both trainer and orchestrator. If None, falls back to the sub-config settings."""
+    monitors: SharedMonitorsConfig = SharedMonitorsConfig()
+    """Shared monitor configs (``monitors.wandb``, ``monitors.file``). Propagated to trainer and orchestrator; ``[orchestrator.monitors.prime]`` configures the platform monitor."""
 
     model: SharedModelConfig | None = None
     """Shared model config. If None, falls back to the sub-config model settings."""
@@ -259,17 +220,18 @@ class RLConfig(BaseConfig):
     seq_len: int | None = None
     """Shared sequence length. Propagates to ``trainer.model.seq_len`` and ``orchestrator.seq_len`` only when those values were not explicitly set; explicit per-component values always win."""
 
-    weight_broadcast: SharedWeightBroadcastConfig | None = None
+    weight_broadcast: WeightBroadcastConfig | None = None
 
     rollout_transport: TransportConfig | None = None
-
-    bench: bool = False
-    """Benchmark mode. Sets trainer and orchestrator to benchmark mode and, when set, suffixes the W&B project with ``-bench``."""
 
     deployment: DeploymentConfig = SingleNodeDeploymentConfig()
 
     slurm: SlurmConfig | None = None
     """SLURM configuration. If None, runs locally."""
+
+    dashboard: bool = True
+    """Make sure a local dashboard daemon serves this run's output dir (started on
+    demand in interactive sessions; an already-running daemon's URL is logged)."""
 
     dry_run: bool = False
     """Only validate and dump resolved configs, then exit early."""
@@ -316,9 +278,9 @@ class RLConfig(BaseConfig):
                     "Cannot configure inference with num_infer_nodes = 0. "
                     "Either set num_infer_nodes > 0 or remove the inference config."
                 )
-            if num_infer_nodes == 0 and not self.trainer.data.fake and not self.bench:
+            if num_infer_nodes == 0 and not self.trainer.data.fake:
                 raise ValueError(
-                    "Must use fake data (trainer.data.fake or bench = true) when num_infer_nodes = 0, "
+                    "Must use fake data (trainer.data.fake) when num_infer_nodes = 0, "
                     "since no orchestrator or inference server will be running."
                 )
         return self
@@ -333,22 +295,6 @@ class RLConfig(BaseConfig):
                     )
         return self
 
-    @model_validator(mode="after")
-    def validate_quantize_in_weight_transfer(self):
-        if not isinstance(self.weight_broadcast, SharedNCCLWeightBroadcastConfig):
-            return self
-
-        if not self.weight_broadcast.quantize_in_weight_transfer:
-            return self
-
-        if self.inference is None:
-            raise ValueError("weight_broadcast.quantize_in_weight_transfer requires an inference config.")
-
-        if self.trainer.model.impl != "custom":
-            raise ValueError("weight_broadcast.quantize_in_weight_transfer requires trainer.model.impl = 'custom'.")
-
-        return self
-
     ### Auto-setup shared configs (before sub-config construction)
 
     @model_validator(mode="before")
@@ -360,18 +306,112 @@ class RLConfig(BaseConfig):
         """
         return propagate_shared_fields(data)
 
+    @model_validator(mode="after")
+    def auto_setup_run_dir(self):
+        """Point trainer and orchestrator at the run directory (``output_dir / run.name``).
+
+        The sub-configs' ``output_dir`` is fully derived here: sub-processes spawned by
+        the launcher receive the resolved run directory and never re-derive it.
+        """
+        self._resolve_run_name()
+        run_dir = self.run_dir
+        for sub in (self.trainer, self.orchestrator):
+            if "output_dir" in sub.model_fields_set and sub.output_dir != run_dir:
+                raise ValueError(
+                    f"{type(sub).__name__}.output_dir ({sub.output_dir}) conflicts with the run directory "
+                    f"({run_dir}). Under the rl entrypoint, sub-config output directories are derived from "
+                    "output_dir / run.name — set those instead."
+                )
+            sub.output_dir = run_dir
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_run_identity(self):
+        """Default the W&B and Prime platform run names to ``run.name``.
+
+        Explicit names always win: only unset names inherit. Runs after the
+        orchestrator's own ``auto_setup_prime_monitor_name``, so an explicitly
+        set W&B name still takes precedence for the platform run name. The run
+        identity itself is runtime-only ($PRL_RUN_ID / $PRL_RUN_NAME, set by the
+        ``rl`` entrypoint), never sub-config.
+        """
+        self._resolve_run_name()
+        for wandb in (self.monitors.wandb, self.trainer.monitors.wandb, self.orchestrator.monitors.wandb):
+            if wandb is not None and wandb.name is None:
+                wandb.name = self.run.name
+        for prime in (self.monitors.prime, self.orchestrator.monitors.prime):
+            if prime is not None and prime.name is None:
+                prime.name = self.run.name
+        return self
+
     ### Validate shared configs (after sub-config construction)
 
     @model_validator(mode="after")
     def validate_shared_configs(self):
-        """Validate consistency of shared configs across trainer, orchestrator, and inference."""
-        validate_shared_output_dir(self.trainer, self.orchestrator)
-        validate_shared_model_name(self.trainer, self.orchestrator, self.inference)
-        validate_shared_tokenizer(self.trainer, self.orchestrator, self.inference)
-        validate_shared_max_steps(self.trainer, self.orchestrator)
-        validate_shared_seq_len(self.trainer, self.orchestrator)
-        validate_shared_ckpt_config(self.trainer, self.orchestrator)
-        validate_shared_wandb_config(self.trainer, self.orchestrator)
+        """Cross-component constraints for values set per sub-config rather than through the
+        shared fields (``propagate_shared_fields`` already rejects shared vs sub-config conflicts)."""
+        trainer, orchestrator, inference = self.trainer, self.orchestrator, self.inference
+
+        def require_equal(name: str, values: dict[str, Any]) -> None:
+            if len({repr(v) for v in values.values()}) > 1:
+                found = ", ".join(f"{path}={value!r}" for path, value in values.items())
+                raise ValueError(f"{name} must match across components ({found}). Set the shared [{name}] instead.")
+
+        # The orchestrator queries the inference server it is paired with; without one, it
+        # must match the trainer whose weights the external server receives.
+        if inference is not None:
+            require_equal(
+                "model.name",
+                {"inference.vllm.model": inference.vllm.model, "orchestrator.model.name": orchestrator.model.name},
+            )
+        else:
+            require_equal(
+                "model.name",
+                {"trainer.model.name": trainer.model.name, "orchestrator.model.name": orchestrator.model.name},
+            )
+        # ``tokenizer.name`` / ``trust_remote_code`` may differ (e.g. FP8-quantized inference variants).
+        chat_templates = {
+            "trainer.tokenizer.chat_template": trainer.tokenizer.chat_template,
+            "orchestrator.tokenizer.chat_template": orchestrator.tokenizer.chat_template,
+        }
+        if inference is not None:
+            chat_templates["inference.vllm.chat_template"] = inference.vllm.chat_template
+        require_equal("tokenizer.chat_template", chat_templates)
+        require_equal(
+            "max_steps", {"trainer.max_steps": trainer.max_steps, "orchestrator.max_steps": orchestrator.max_steps}
+        )
+        require_equal("resume", {"trainer.resume": trainer.resume, "orchestrator.resume": orchestrator.resume})
+        if trainer.model.seq_len < orchestrator.seq_len:
+            raise ValueError(
+                f"trainer.model.seq_len ({trainer.model.seq_len}) must be >= orchestrator.seq_len "
+                f"({orchestrator.seq_len}) so the trainer can handle every sequence the orchestrator produces."
+            )
+        if (trainer.ckpt is None) != (orchestrator.ckpt is None):
+            raise ValueError(
+                "Checkpointing must be configured on both trainer and orchestrator. Use the shared [ckpt]."
+            )
+        if trainer.ckpt and orchestrator.ckpt:
+            require_equal(
+                "ckpt.interval",
+                {
+                    "trainer.ckpt.interval": trainer.ckpt.interval,
+                    "orchestrator.ckpt.interval": orchestrator.ckpt.interval,
+                },
+            )
+        trainer_wandb, orchestrator_wandb = trainer.monitors.wandb, orchestrator.monitors.wandb
+        if (trainer_wandb is None) != (orchestrator_wandb is None):
+            raise ValueError(
+                "W&B must be configured on both trainer and orchestrator, otherwise only one side's "
+                "metrics are logged. Use the shared [monitors.wandb]."
+            )
+        if trainer_wandb and orchestrator_wandb:
+            require_equal(
+                "monitors.wandb.project",
+                {
+                    "trainer.monitors.wandb.project": trainer_wandb.project,
+                    "orchestrator.monitors.wandb.project": orchestrator_wandb.project,
+                },
+            )
         return self
 
     @model_validator(mode="after")
@@ -384,42 +424,28 @@ class RLConfig(BaseConfig):
         """
         if self.weight_broadcast is None:
             if self.trainer.model.lora is not None or self.inference is None:
-                self.weight_broadcast = SharedFileSystemWeightBroadcastConfig()
+                self.weight_broadcast = FileSystemWeightBroadcastConfig()
             else:
-                self.weight_broadcast = SharedNCCLWeightBroadcastConfig()
+                self.weight_broadcast = NCCLWeightBroadcastConfig()
         if self.weight_broadcast.type != "filesystem" and self.trainer.model.lora is not None:
             raise ValueError(
-                "LoRA training is not yet supported with in-memory weight broadcast. "
-                "Set weight_broadcast.type = 'filesystem'."
+                "LoRA requires weight_broadcast.type = 'filesystem': vLLM loads adapters only from a "
+                "PEFT-shaped directory on disk (LoRAModel.from_local_checkpoint) - in-memory transports "
+                "have no disk artifact to load from."
             )
-        if self.weight_broadcast.type in ("nccl", "nixl"):
-            inference_world_size = self.inference.parallel.dp * self.inference.parallel.tp if self.inference else 1
-            common_config = dict(
-                host=self.weight_broadcast.host,
-                port=self.weight_broadcast.port,
-                timeout=self.weight_broadcast.timeout,
-                inference_world_size=inference_world_size,
+        if "inference_world_size" in self.weight_broadcast.model_fields_set:
+            raise ValueError("weight_broadcast.inference_world_size is set automatically by rl; remove it.")
+        update = {}
+        if self.weight_broadcast.type != "filesystem":
+            update["inference_world_size"] = (
+                self.inference.vllm.data_parallel_size * self.inference.vllm.tensor_parallel_size
+                if self.inference
+                else 1
             )
-            if self.weight_broadcast.type == "nccl":
-                transport_config = dict(
-                    quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
-                )
-                trainer_config_type = TrainerNCCLWeightBroadcastConfig
-                orchestrator_config_type = OrchestratorNCCLWeightBroadcastConfig
-            else:
-                transport_config = dict(session_id=self.weight_broadcast.session_id)
-                trainer_config_type = TrainerNIXLWeightBroadcastConfig
-                orchestrator_config_type = OrchestratorNIXLWeightBroadcastConfig
-            self.trainer.weight_broadcast = trainer_config_type(**common_config, **transport_config)
-            self.orchestrator.weight_broadcast = orchestrator_config_type(**common_config, **transport_config)
-        elif self.weight_broadcast.type == "filesystem":
-            self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig()
-            self.orchestrator.weight_broadcast = OrchestratorFileSystemWeightBroadcastConfig()
+        self.trainer.weight_broadcast = self.weight_broadcast.model_copy(update=update)
+        self.orchestrator.weight_broadcast = self.weight_broadcast.model_copy(update=update)
         if self.inference is not None:
             self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)
-
-        validate_shared_weight_broadcast(self.trainer, self.orchestrator, self.inference)
-
         return self
 
     @model_validator(mode="after")
@@ -445,36 +471,9 @@ class RLConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
-    def validate_eplb_requires_quantized_weight_transfer(self):
-        if self.inference is None or not self.inference.enable_eplb:
-            return self
-
-        # TODO(matej): check if weight reloading works itself before supporting EPLB without quantized transfer.
-        trainer_weight_broadcast = self.trainer.weight_broadcast
-        if trainer_weight_broadcast.type != "nccl" or not trainer_weight_broadcast.quantize_in_weight_transfer:
-            raise ValueError(
-                "inference.enable_eplb requires weight_broadcast.type = 'nccl' and "
-                "weight_broadcast.quantize_in_weight_transfer = true."
-            )
-
-        return self
-
-    @model_validator(mode="after")
-    def auto_setup_bench(self):
-        if self.bench:
-            self.trainer.bench = BenchConfig()
-            self.orchestrator.bench = True
-            self.trainer.data.fake = FakeDataLoaderConfig(
-                batch_size=self.orchestrator.batch_size or 32,
-            )
-
-        trainer_bench_enabled = self.trainer.bench is not None
-        if trainer_bench_enabled != self.orchestrator.bench:
-            raise ValueError(
-                f"Trainer benchmark mode ({self.trainer.bench}) and orchestrator benchmark mode "
-                f"({self.orchestrator.bench}) must match. Use the top-level bench = true to set both."
-            )
-
+    def validate_eplb(self):
+        if self.inference is not None and self.inference.vllm.enable_eplb:
+            raise ValueError("inference.vllm.enable_eplb is not supported with RL weight updates.")
         return self
 
     @model_validator(mode="after")
@@ -511,14 +510,9 @@ class RLConfig(BaseConfig):
             if self.orchestrator.model.lora.alpha is None:
                 self.orchestrator.model.lora.alpha = self.trainer.model.lora.alpha
 
-            if self.orchestrator.model.lora.name is None:
-                self.orchestrator.model.lora.name = (
-                    f"r{self.orchestrator.model.lora.rank}-a{self.orchestrator.model.lora.alpha}"
-                )
-
             if self.inference is not None:
-                self.inference.enable_lora = True
-                self.inference.max_lora_rank = self.trainer.model.lora.rank
+                self.inference.vllm.enable_lora = True
+                self.inference.vllm.max_lora_rank = self.trainer.model.lora.rank
             else:
                 warnings.warn(
                     "LoRA is enabled, but inference is not configured. When manually starting the inference server, "
@@ -532,12 +526,12 @@ class RLConfig(BaseConfig):
     def auto_setup_router_replay(self):
         if self.trainer.enable_router_replay:
             if self.inference is not None:
-                if self.inference.enable_return_routed_experts is False:
+                if self.inference.vllm.enable_return_routed_experts is False:
                     warnings.warn(
-                        "Router replay is enabled, but inference.enable_return_routed_experts is False. Setting to True.",
+                        "Router replay is enabled, but inference.vllm.enable_return_routed_experts is False. Setting to True.",
                         stacklevel=2,
                     )
-                self.inference.enable_return_routed_experts = True
+                self.inference.vllm.enable_return_routed_experts = True
             else:
                 warnings.warn(
                     "Router replay is enabled, but inference is not configured. When manually starting the inference server, make sure to pass `--enable-return-routed-experts` to the vLLM server.",
@@ -553,12 +547,12 @@ class RLConfig(BaseConfig):
         ``trainer.enable_router_replay`` path, which sets the inference flag here
         (after InferenceConfig's own validators, which therefore miss it).
         """
-        if self.inference is not None and self.inference.enable_return_routed_experts:
+        if self.inference is not None and self.inference.vllm.enable_return_routed_experts:
             router = self.inference.router
             if router is not None and router.type == "llm-d":
                 raise ValueError(
                     "The llm-d router backend does not support routed-expert return "
-                    "(inference.enable_return_routed_experts / trainer.enable_router_replay): it "
+                    "(inference.vllm.enable_return_routed_experts / trainer.enable_router_replay): it "
                     "breaks P/D and is unverified for multi-node. Use router type 'vllm-router' "
                     "for router-replay runs."
                 )
@@ -568,6 +562,51 @@ class RLConfig(BaseConfig):
     def validate_multi_node_requires_router(self):
         if self.deployment.type == "multi_node" and self.inference is not None and self.inference.router is None:
             raise ValueError("Multi-node deployments require inference.router to front the per-rank engines.")
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_sampling_mask_capture(self):
+        """Truncated train sampling needs the inference server to return the sampling
+        masks the trainer replays (OrchestratorConfig guarantees truncating
+        configs are bounded by TRAIN_TOP_K_BOUND). Capture is engine-wide: while it is
+        on, vLLM rejects requests with ``temperature <= 0`` or without ``top_k > 0``,
+        so eval sampling against the same server must set both."""
+        policy_samplings = [
+            env.sampling for env in self.orchestrator.train.source if env.algo.sampling.source == "policy"
+        ] or ([self.orchestrator.train.sampling] if not self.orchestrator.train.source else [])
+        if not any(sampling.truncates_distribution() for sampling in policy_samplings):
+            return self
+        if self.inference is None:
+            warnings.warn(
+                "Truncated train sampling with no managed inference server: set "
+                "`enable_return_sampling_mask = true` on the standalone server's config so it "
+                "returns the sampling masks the trainer replays.",
+                stacklevel=2,
+            )
+            return self
+        self.inference.enable_return_sampling_mask = True
+        if self.orchestrator.eval is not None:
+            warnings.warn(
+                "Sampling-mask capture is engine-wide: eval requests without top_k > 0 (from the "
+                "eval sampling config or the model's generation config) or with temperature 0 are "
+                "rejected by the inference server while truncated train sampling is on.",
+                stacklevel=2,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_disaggregated_no_routed_experts(self):
+        """Runs after ``auto_setup_router_replay``, which sets the inference flag after InferenceConfig's validators."""
+        inference = self.inference
+        if (
+            inference is not None
+            and inference.deployment.type == "disaggregated"
+            and inference.vllm.enable_return_routed_experts
+        ):
+            raise ValueError(
+                "Router replay (inference.vllm.enable_return_routed_experts / trainer.enable_router_replay) "
+                "is not supported with disaggregated P/D: vLLM does not capture routed experts across NIXL KV transfer."
+            )
         return self
 
     @model_validator(mode="after")
@@ -599,6 +638,7 @@ class RLConfig(BaseConfig):
 
     @model_validator(mode="after")
     def auto_setup_deployment(self):
+        self.orchestrator.pad_to_multiple_of = self.trainer.model.cp
         if self.deployment.type == "single_node":  # single-node
             # set num_train_workers to the number of data replicas
             non_data_parallel_size = self.trainer.model.cp
@@ -608,20 +648,22 @@ class RLConfig(BaseConfig):
             # fill up inference capacity with dp ranks
             if self.inference is not None:
                 num_infer_gpus = self.deployment.num_infer_gpus
-                if num_infer_gpus != self.inference.parallel.dp * self.inference.parallel.tp:
-                    assert num_infer_gpus % self.inference.parallel.tp == 0, (
+                if num_infer_gpus != self.inference.vllm.data_parallel_size * self.inference.vllm.tensor_parallel_size:
+                    assert num_infer_gpus % self.inference.vllm.tensor_parallel_size == 0, (
                         "Number of inference GPUs must be divisible by the tensor parallel size"
                     )
-                    self.inference.parallel.dp = num_infer_gpus // self.inference.parallel.tp
+                    self.inference.vllm.data_parallel_size = num_infer_gpus // self.inference.vllm.tensor_parallel_size
                 # Ensure api_server_count matches DP so all workers are created.
                 # Without this, in-memory weight transfer expects dp*tp workers
                 # but only api_server_count*tp exist, causing a deadlock.
-                dp = self.inference.parallel.dp
-                if self.inference.api_server_count < dp and not self.inference.enable_lora:
-                    self.inference.api_server_count = dp
+                dp = self.inference.vllm.data_parallel_size
+                if self.inference.vllm.api_server_count < dp and not self.inference.vllm.enable_lora:
+                    self.inference.vllm.api_server_count = dp
 
         elif self.deployment.type == "multi_node":  # multi-node
-            self.orchestrator.num_train_workers = self.deployment.num_train_nodes * self.deployment.gpus_per_node
+            self.orchestrator.num_train_workers = (
+                self.deployment.num_train_nodes * self.deployment.gpus_per_node // self.trainer.model.cp
+            )
 
             if self.deployment.nodes_per_fsdp_group is not None:
                 if self.deployment.num_train_nodes % self.deployment.nodes_per_fsdp_group != 0:
@@ -635,35 +677,38 @@ class RLConfig(BaseConfig):
 
             if (
                 self.inference is not None
-                and self.inference.enable_expert_parallel
+                and self.inference.vllm.enable_expert_parallel
                 and self.inference.deployment.type != "disaggregated"
             ):
-                inference_tp = self.inference.parallel.tp
+                inference_tp = self.inference.vllm.tensor_parallel_size
                 if self.deployment.gpus_per_node % inference_tp != 0:
                     raise ValueError(
-                        "deployment.gpus_per_node must be divisible by inference.parallel.tp "
-                        "when inference.enable_expert_parallel is enabled in multi-node deployment."
+                        "deployment.gpus_per_node must be divisible by inference.vllm.tensor_parallel_size "
+                        "when inference.vllm.enable_expert_parallel is enabled in multi-node deployment."
                     )
 
                 inferred_dp_local = self.deployment.gpus_per_node // inference_tp
                 total_infer_gpus = self.deployment.infer_nodes_per_replica * self.deployment.gpus_per_node
-                expected_global_world_size = self.inference.parallel.dp * inference_tp
+                expected_global_world_size = self.inference.vllm.data_parallel_size * inference_tp
                 if expected_global_world_size != total_infer_gpus:
                     raise ValueError(
-                        "For multi-node expert parallel inference, inference.parallel.dp * inference.parallel.tp "
+                        "For multi-node expert parallel inference, inference.vllm.data_parallel_size * inference.vllm.tensor_parallel_size "
                         f"must match total inference GPUs ({total_infer_gpus}), got {expected_global_world_size}."
                     )
 
-                if self.inference.data_parallel_size_local is None:
-                    self.inference.data_parallel_size_local = inferred_dp_local
-                elif self.inference.data_parallel_size_local != inferred_dp_local:
+                if self.inference.vllm.data_parallel_size_local is None:
+                    self.inference.vllm.data_parallel_size_local = inferred_dp_local
+                elif self.inference.vllm.data_parallel_size_local != inferred_dp_local:
                     raise ValueError(
-                        "inference.data_parallel_size_local must equal deployment.gpus_per_node / inference.parallel.tp "
-                        f"({inferred_dp_local}) when inference.enable_expert_parallel is enabled in multi-node deployment."
+                        "inference.vllm.data_parallel_size_local must equal deployment.gpus_per_node / inference.vllm.tensor_parallel_size "
+                        f"({inferred_dp_local}) when inference.vllm.enable_expert_parallel is enabled in multi-node deployment."
                     )
 
-                if not self.inference.enable_lora and self.inference.api_server_count == self.inference.parallel.dp:
-                    self.inference.api_server_count = inferred_dp_local
+                if (
+                    not self.inference.vllm.enable_lora
+                    and self.inference.vllm.api_server_count == self.inference.vllm.data_parallel_size
+                ):
+                    self.inference.vllm.api_server_count = inferred_dp_local
 
             # Auto-infer DP and api_server_count for standard multi-node inference.
             # Without EP, vLLM only creates api_server_count * tp workers per node,
@@ -671,16 +716,16 @@ class RLConfig(BaseConfig):
             # more workers than exist, deadlocking in-memory transfer initialization.
             if (
                 self.inference is not None
-                and not self.inference.enable_expert_parallel
+                and not self.inference.vllm.enable_expert_parallel
                 and self.inference.deployment.type != "disaggregated"
             ):
-                dp_per_node = self.deployment.gpus_per_node // self.inference.parallel.tp
-                if self.inference.parallel.dp == 1 and dp_per_node > 1:
-                    self.inference.parallel.dp = dp_per_node
-                if self.inference.data_parallel_size_local is None and dp_per_node > 1:
-                    self.inference.data_parallel_size_local = dp_per_node
-                if self.inference.api_server_count == 1 and dp_per_node > 1:
-                    self.inference.api_server_count = dp_per_node
+                dp_per_node = self.deployment.gpus_per_node // self.inference.vllm.tensor_parallel_size
+                if self.inference.vllm.data_parallel_size == 1 and dp_per_node > 1:
+                    self.inference.vllm.data_parallel_size = dp_per_node
+                if self.inference.vllm.data_parallel_size_local is None and dp_per_node > 1:
+                    self.inference.vllm.data_parallel_size_local = dp_per_node
+                if self.inference.vllm.api_server_count == 1 and dp_per_node > 1:
+                    self.inference.vllm.api_server_count = dp_per_node
 
             if self.weight_broadcast is not None and self.weight_broadcast.type in ("nccl", "nixl"):
                 # Every allocated inference GPU is an in-memory transfer worker.
@@ -721,7 +766,7 @@ class RLConfig(BaseConfig):
             # External-LB: one admin client per DP rank, so roles expand per rank
             # (stride = dp_local = gpus_per_node / tp). ADMIN_URLS lists all prefill
             # ranks, then all decode ranks, per replica — match that order.
-            stride = self.deployment.gpus_per_node // self.inference.parallel.tp
+            stride = self.deployment.gpus_per_node // self.inference.vllm.tensor_parallel_size
             role_order = ["prefill"] * (infer_deploy.num_prefill_nodes * stride) + ["decode"] * (
                 infer_deploy.num_decode_nodes * stride
             )
@@ -749,7 +794,7 @@ class RLConfig(BaseConfig):
         if not self.orchestrator.any_policy_sourced and "base_url" not in client.model_fields_set:
             host = self.inference.server.host or "localhost"
             port = self.inference.server.port
-            client.base_url = [f"http://{host}:{port}/v1"]
+            client.base_url = f"http://{host}:{port}/v1"
         if (
             self.deployment.type == "single_node"
             and self.inference.router is not None

@@ -32,12 +32,11 @@ from transformers.modeling_outputs import (
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
-from transformers.utils.deprecation import deprecate_kwarg
 
 from prime_rl.trainer.models.base import PreTrainedModelPrimeRL
 from prime_rl.trainer.models.layers.attn import ATTN_IMPL2CLASS, AttentionConfig
 from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput
-from prime_rl.trainer.models.layers.mlp import MLP, MLPConfig
+from prime_rl.trainer.models.layers.mlp import FeedForward
 from prime_rl.trainer.models.layers.norms import RMSNorm, RMSNormConfig
 from prime_rl.trainer.models.layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig
 from prime_rl.utils.sequence import get_cu_seqlens_from_seq_lens
@@ -62,17 +61,15 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         )
         self.self_attn = ATTN_IMPL2CLASS[config._attn_implementation](attn_config)
 
-        mlp_config = MLPConfig(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            gate_act=config.hidden_act,
+        self.mlp = FeedForward(
+            dim=config.hidden_size,
+            hidden_dim=config.intermediate_size,
+            activation=config.hidden_act,
             bias=config.mlp_bias,
         )
-        self.mlp = MLP(mlp_config)
         self.input_layernorm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attention_layernorm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.rms_norm_eps))
 
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
