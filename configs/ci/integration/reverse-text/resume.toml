@@ -8,7 +8,9 @@ seq_len = 2048
 type = "filesystem"
 
 [ckpt]
-resume_step = 15
+
+[resume]
+step = 15
 
 [model]
 name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
@@ -18,22 +20,21 @@ lr = 3e-6
 
 [orchestrator]
 batch_size = 128
+
+[orchestrator.train]
 group_size = 16
+
+[orchestrator.concurrency]
+max_inflight = 128
 
 [orchestrator.train.sampling]
 max_completion_tokens = 128
 
 [[orchestrator.train.source]]
 name = "reverse-text"
-
-[orchestrator.train.source.env.taskset]
-id = "reverse-text-v1"
-
-[orchestrator.train.source.env.agent.harness]
-id = "null"
-
-[orchestrator.train.source.env.agent.runtime]
-type = "subprocess"
+env.taskset.id = "reverse-text"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [inference]
 

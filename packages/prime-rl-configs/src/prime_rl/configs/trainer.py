@@ -1,26 +1,28 @@
+import re
 import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import Field, model_validator
+from pydantic import BeforeValidator, Field, field_validator, model_validator
 
+from prime_rl.configs.monitors import MonitorsConfig
 from prime_rl.configs.shared import (
     BaseModelConfig,
     EnvVars,
-    FileMonitorConfig,
+    FileSystemWeightBroadcastConfig,
     HeartbeatConfig,
-    MetricsServerConfig,
+    ResumeConfig,
     TrainerLogConfig,
     TransportConfig,
-    WandbConfig,
+    WeightBroadcastConfig,
     ZMQTransportConfig,
 )
-from prime_rl.utils.config import BaseConfig
+from prime_rl.utils.config import BaseConfig, default_output_dir
 
 # -- Shared trainer configs (used by both SFT and RL trainers) --
 
 AttnImplementation: TypeAlias = Literal["flash_attention_2", "flash_attention_3", "flash_attention_4", "auto"]
-EPCommBackend: TypeAlias = Literal["torch", "deepep"]
+DSABackend: TypeAlias = Literal["tilelang", "cudnn_flashmla"]
 
 
 class GCConfig(BaseConfig):
@@ -30,20 +32,13 @@ class GCConfig(BaseConfig):
 
 class ActivationCheckpointConfig(BaseConfig):
     mode: Literal["full", "selective"] = "full"
-    """``full`` checkpoints whole transformer blocks; ``selective`` checkpoints only the subcomponents listed in ``targets`` inside supported custom decoder layers."""
+    """Both modes checkpoint whole transformer blocks. ``selective`` additionally retains selected operations."""
 
     freq: int = Field(1, ge=1)
     """Apply activation checkpointing to every N layers."""
 
-    targets: list[str] = ["norm"]
-    """Selective checkpoint targets. ``norm`` checkpoints every norm module inside selected layers. ``attn_proj`` checkpoints projection-side attention work outside the kernel (input/output projections, attention-local norms, RoPE, gating, model-specific MLA projection helpers). ``mlp`` checkpoints the entire dense MLP forward (not for MoE). ``mla_up_proj`` checkpoints MLA Q/KV up-projection where supported. ``routed_experts`` checkpoints routed expert compute in MoE layers (including LatentMoE). ``linear_attn`` checkpoints non-softmax token mixers (NemotronH Mamba, Qwen3.5-MoE GatedDeltaNet, AFMoE sliding-window attention)."""
-
-    @model_validator(mode="after")
-    def validate_selective_targets(self):
-        self.targets = list(dict.fromkeys(self.targets))
-        if self.mode == "selective" and not self.targets:
-            raise ValueError("Selective activation checkpointing requires at least one target.")
-        return self
+    targets: list[str] | None = None
+    """Operator names or namespaces retained in selective mode. ``None`` uses the default targets; an explicit list replaces them."""
 
 
 class ActivationOffloadingConfig(BaseConfig):
@@ -54,14 +49,50 @@ class ActivationOffloadingConfig(BaseConfig):
     """Max activations kept in flight while offloading. More activations smooth overlap at the cost of GPU memory."""
 
 
+class OptimizerInBackwardOffloadConfig(BaseConfig):
+    """Full CPU optimizer offload: FP32 masters, optimizer state (AdamW moments; SignSGD is
+    stateless), and accumulated gradients live in CPU RAM, each optimizer chunk runs on CPU as
+    soon as its last gradient arrives, and the refreshed BF16 weights stream back while backward
+    is still executing.
+
+    Gradient numerics: gradients are reduced across ranks in FP32 (``reduce_dtype``) but FSDP2
+    materializes them in the sharded parameter's dtype, which is BF16 for the offload compute
+    model — so each gradient is rounded to BF16 once before the FP32 CPU update. Masters,
+    moments, accumulation, and optimizer arithmetic remain FP32. For gradient numerics
+    bit-faithful to that path, disable offloading.
+    """
+
+    numa_bind: bool = True
+    """Pin each rank's CPUs to its GPU's NUMA node. Disable when the launcher already manages CPU affinity or GPU sysfs topology is unavailable."""
+
+
+def _normalize_optimizer_in_backward_offload(value: Any) -> Any:
+    if value is True:
+        return {}
+    if value is False:
+        return None
+    return value
+
+
+OptimizerInBackwardOffload = Annotated[
+    OptimizerInBackwardOffloadConfig | None, BeforeValidator(_normalize_optimizer_in_backward_offload)
+]
+
+
 class CompileConfig(BaseConfig):
     fullgraph: bool = False
-    """Compile transformer blocks with ``fullgraph=True``."""
+    """Compile transformer blocks with ``fullgraph=True``. Custom MoE models need ``moe_router_dtype="bfloat16"``: the fp32 router is its own FSDP unit inside the block, and dynamo cannot trace FSDP hooks."""
+
+    mode: Literal["reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs", "lite"] | None = None
+    """``torch.compile`` mode. ``reduce-overhead`` records CUDA graphs to cut kernel launch overhead; ``max-autotune`` modes trade longer compile times for tuned kernels (``max-autotune`` also records CUDA graphs, ``max-autotune-no-cudagraphs`` does not). CUDA-graphed layers re-record on new input shapes. ``None`` uses PyTorch's default mode."""
 
 
-class BenchConfig(BaseConfig):
-    output_json: Path | None = None
-    """Path to write benchmark results as JSON. If unset, results are only printed to the console."""
+class FusionsConfig(BaseConfig):
+    enabled: list[Literal["gate_up", "qkv"]] = ["gate_up", "qkv"]
+    """Runtime parameter fusions. ``gate_up`` runs each MoE expert's gate and up projections as one grouped GEMM; ``qkv`` runs attention's q, k and v projections as one GEMM. Only modules that support a fusion are packed, checkpoints keep the canonical parameter names and shapes, and fusions are skipped when LoRA is enabled. Set to ``[]`` to disable."""
+
+    shard_fused_on_dim1: bool = False
+    """Experimental. Shard fused 2-D weights along dim 1 under FSDP so that weight loading and checkpointing are zero-copy: the checkpoint reads and writes the fused weights and their optimizer state in place, instead of assembling a full copy of every fused weight on each rank first. Requires the hidden size to be divisible by the FSDP shard mesh size."""
 
 
 class IndexCacheConfig(BaseConfig):
@@ -94,7 +125,7 @@ class LoRAConfig(BaseConfig):
         "fc1_latent_proj",
         "fc2_latent_proj",
     ]
-    """Module names or regex patterns to apply LoRA to. Simple names (e.g. ``q_proj``) match any component in the module path; regex patterns match anywhere in the name. Names unknown to the current model are silently ignored, so defaults cover multiple architectures. NemotronH note: ``experts`` matches NonGatedGroupedExperts inside LatentMoE; ``fc1_latent_proj``/``fc2_latent_proj`` adapt the latent up/down projections. Add ``in_proj``/``out_proj`` to also LoRA Mamba."""
+    """Module names or regex patterns to apply LoRA to. Simple names (e.g. ``q_proj``) match any component in the module path; regex patterns match anywhere in the name. Names unknown to the current model are silently ignored, so defaults cover multiple architectures. NemotronH note: ``experts`` matches the ReLU² grouped experts; ``fc1_latent_proj``/``fc2_latent_proj`` adapt the latent projections. Add ``in_proj``/``out_proj`` to also LoRA Mamba."""
 
     modules_to_save: list[str] = []
     """Module names or regex patterns to keep fully trainable (not freeze). Same matching rules as ``target_modules``."""
@@ -122,7 +153,7 @@ _DEFAULT_FP8_IGNORE_PATTERNS: list[str] = [
     # in BF16 on the trainer while inference quantized it to FP8, causing
     # hidden-state drift before the MoE router.
     r"mlp\.gate\.",
-    "shared_expert_gate",  # Qwen3.5 MoE: nn.Linear(hidden, 1, bias=False)
+    r"shared_expert\.output_gate",  # Qwen3.5 MoE: nn.Linear(hidden, 1, bias=False)
     "eh_proj",
     "weights_proj",
     "in_proj_a",
@@ -132,19 +163,107 @@ _DEFAULT_FP8_IGNORE_PATTERNS: list[str] = [
 
 class FP8Config(BaseConfig):
     type: Literal["fp8"] = "fp8"
-    enable_grouped_gemm: bool = True
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
+    """Dense linear module names excluded from DeepGEMM FP8 replacement."""
 
 
 class MXFP8Config(BaseConfig):
     type: Literal["mxfp8"] = "mxfp8"
     recipe: MXFP8Recipe = "mxfp8_rceil"
-    enable_grouped_gemm: bool = True
-    enable_a2a: bool = True
+    """MXFP8 recipe for dense linear modules."""
+
     ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
+    """Dense linear module names excluded from torchao MXFP8 replacement."""
 
 
 QuantizationConfig: TypeAlias = Annotated[FP8Config | MXFP8Config, Field(discriminator="type")]
+
+
+class MoEComputeConfigBase(BaseConfig):
+    apply_to: str | list[Annotated[int, Field(ge=0, strict=True)]] = "all"
+    """Model layers to use this backend for: ``"all"``, a percentage such as ``"85%"``,
+    or zero-based layer indices such as ``[0, 1, 2]``. Percentages select the first fraction
+    of model layers, rounded down. Other expert groups use BF16 compute and transport.
+    """
+
+    @field_validator("apply_to")
+    @classmethod
+    def validate_apply_to(cls, value: str | list[int]) -> str | list[int]:
+        if isinstance(value, str) and value != "all":
+            if re.fullmatch(r"\d+(?:\.\d+)?%", value) is None or float(value[:-1]) > 100:
+                raise ValueError('apply_to must be "all", a percentage from "0%" to "100%", or a list of layer indices')
+        return value
+
+    def resolve_layers(self, num_layers: int) -> set[int]:
+        if isinstance(self.apply_to, list):
+            invalid = [index for index in self.apply_to if index >= num_layers]
+            if invalid:
+                raise ValueError(
+                    f"apply_to layer indices {invalid} are out of range for a model with {num_layers} layers"
+                )
+            return set(self.apply_to)
+        count = num_layers if self.apply_to == "all" else int(num_layers * float(self.apply_to[:-1]) / 100)
+        return set(range(count))
+
+
+class BF16MoEComputeConfig(MoEComputeConfigBase):
+    """Run routed experts in bfloat16."""
+
+    type: Literal["bf16"] = "bf16"
+    backend: Literal["torch", "sonicmoe"] = "torch"
+    """Expert compute implementation."""
+
+
+class DeepGemmFP8MoEComputeConfig(MoEComputeConfigBase):
+    """Run routed-expert grouped GEMMs with DeepGEMM FP8 kernels."""
+
+    type: Literal["deepgemm_fp8"] = "deepgemm_fp8"
+
+
+class MXFP8MoEComputeConfig(MoEComputeConfigBase):
+    """Run routed-expert grouped GEMMs with Prime's vendored MXFP8 implementation."""
+
+    type: Literal["mxfp8"] = "mxfp8"
+    recipe: MXFP8Recipe = "mxfp8_rceil"
+    """MXFP8 expert-compute recipe."""
+
+
+MoEComputeConfig: TypeAlias = Annotated[
+    BF16MoEComputeConfig | DeepGemmFP8MoEComputeConfig | MXFP8MoEComputeConfig,
+    Field(discriminator="type"),
+]
+
+
+class TorchMoEDispatchConfig(BaseConfig):
+    """Dispatch and combine routed tokens with torch all-to-all collectives."""
+
+    type: Literal["torch"] = "torch"
+    transport: Literal["bf16", "mxfp8"] = "bf16"
+    """Wire format for routed activations and their reverse-path gradients."""
+
+
+class DeepEPMoEDispatchConfig(BaseConfig):
+    """Dispatch and combine routed tokens with DeepEP."""
+
+    type: Literal["deepep"] = "deepep"
+    num_sms: int = Field(20, ge=1)
+    """SMs allocated to DeepEP communication kernels."""
+
+    token_chunk_size: int | None = Field(None, ge=1)
+    """Optional chunk size used to pipeline dispatch with local expert compute."""
+
+
+MoEDispatchConfig: TypeAlias = Annotated[
+    TorchMoEDispatchConfig | DeepEPMoEDispatchConfig,
+    Field(discriminator="type"),
+]
+
+
+class MoERuntimeConfig(BaseConfig):
+    """Independent routed-expert compute and token-dispatch choices."""
+
+    compute: MoEComputeConfig = BF16MoEComputeConfig()
+    dispatch: MoEDispatchConfig = TorchMoEDispatchConfig()
 
 
 class ModelConfig(BaseModelConfig):
@@ -160,6 +279,9 @@ class ModelConfig(BaseModelConfig):
     compile: CompileConfig | None = CompileConfig()
     """Compile the model with ``torch.compile``."""
 
+    fusions: FusionsConfig = FusionsConfig()
+    """Runtime parameter fusions, on by default."""
+
     ac: ActivationCheckpointConfig | None = ActivationCheckpointConfig()
     """Activation checkpointing configuration. If None, activation checkpointing is disabled."""
 
@@ -172,6 +294,9 @@ class ModelConfig(BaseModelConfig):
     optim_cpu_offload: bool = True
     """Offload only optimizer states (momentum, variance) to CPU, keeping weights on GPU. Avoids the H2D all-gather overhead of FSDP CPU offload while still saving GPU memory."""
 
+    full_offload: OptimizerInBackwardOffload = None
+    """Full CPU optimizer offload: FP32 masters, moments, and gradients live in CPU RAM and the optimizer runs on CPU, overlapped with backward. Enable with ``true`` or a ``[model.full_offload]`` section; disabled by default."""
+
     reshard_after_forward: bool = True
     """Reshard the model after each forward pass."""
 
@@ -181,14 +306,8 @@ class ModelConfig(BaseModelConfig):
     ep: int | Literal["auto"] = "auto"
     """Expert parallelism degree for MoE layers. 1 disables EP. ``auto`` resolves to ``min(fsdp_island_size, 8)`` for MoE models (where ``fsdp_island_size = world_size // dp_replicate``), and to 1 for non-MoE models. Set an explicit integer to override."""
 
-    ep_comm_backend: EPCommBackend = "torch"
-    """Communication backend for expert parallelism. ``torch`` uses TorchTitan all-to-all collectives; ``deepep`` uses DeepEP custom kernels."""
-
-    deepep_num_sms: int = Field(20, ge=1)
-    """SMs allocated for DeepEP intranode dispatch/combine kernels. Also determines internode RDMA channel count (``num_channels = num_sms / 2``). Lower values leave more SMs for compute; higher values speed up dispatch/combine. The optimal value depends on EP degree and hardware. Only used when ``ep_comm_backend='deepep'``."""
-
-    deepep_token_chunk_size: int | None = Field(None, ge=1)
-    """Token chunk size for DeepEP MoE pipelining. When set, DeepEP dispatch for chunk i+1 is launched while experts compute chunk i. Only used when ``ep_comm_backend='deepep'``."""
+    moe: MoERuntimeConfig = MoERuntimeConfig()
+    """Routed-expert compute and token-dispatch runtime."""
 
     cp: int = 1
     """Context parallelism degree. 1 disables CP."""
@@ -196,22 +315,19 @@ class ModelConfig(BaseModelConfig):
     cp_style: Literal["ring", "ulysses"] = "ring"
     """CP communication style. ``ring`` uses ring-attention all-gather/reduce-scatter (requires custom kernels per attention type). ``ulysses`` uses all-to-all to redistribute Q/K/V from sequence-sharded to head-sharded, runs vanilla attention locally on the full sequence, then all-to-all back — works out-of-the-box with any attention kernel (softmax FA, linear attention, mamba, etc.)."""
 
-    impl: Literal["hf", "custom", "auto"] = "auto"
-    """Model implementation. ``auto`` selects ``custom`` if supported by the model, otherwise ``hf``."""
-
     optimization_dtype: Literal["bfloat16", "float32"] = "float32"
     """dtype for model optimization."""
 
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     """dtype for gradient/parameter reductions."""
 
-    moe_router_dtype: Literal["bfloat16", "float32"] = "float32"
-    """Compute dtype for MoE router gates. ``float32`` (default) keeps router gate weights in fp32 through forward and backward (exempt from FSDP bf16 parameter casting) and computes the gate GEMM and routing logits in fp32, matching models trained with fp32 routing (e.g. GLM-5.x via Megatron's ``--moe-router-dtype fp32``). ``bfloat16`` computes the gate GEMM in the model compute dtype. Router score functions (sigmoid/softmax) run in fp32 regardless. Only affects the custom MoE implementation; a no-op for non-MoE and HF-impl models."""
-
-    moe_use_grouped_mm: bool = True
-    """Use grouped mm for MoE layers. Requires compute capability ≥ 9.0."""
+    moe_router_dtype: Literal["bfloat16", "float32", "auto"] = "auto"
+    """Compute dtype for MoE router gates. ``float32`` keeps router gate weights in fp32 through forward and backward (exempt from FSDP bf16 parameter casting) and computes the gate GEMM and routing logits in fp32, matching models trained with fp32 routing (e.g. GLM-5.x via Megatron's ``--moe-router-dtype fp32``). ``bfloat16`` computes the gate GEMM in the model compute dtype. ``auto`` (default) resolves to ``float32`` for RL and ``bfloat16`` for SFT. Router score functions (sigmoid/softmax) run in fp32 regardless. A no-op for non-MoE models."""
 
     quantization: QuantizationConfig | None = None
+
+    dsa_backend: DSABackend = "tilelang"
+    """Kernels for the DSA sparse MLA attention (``glm_moe_dsa``, e.g. GLM-5). ``tilelang`` runs the TileLang forward and backward. ``cudnn_flashmla`` runs the FlashMLA sparse prefill forward with the cuDNN frontend CuTe-DSL backward; it needs the ``flash-mla`` extra and an SM90 GPU (SM100/SM103 are wired up but untested)."""
 
     index_cache: IndexCacheConfig | None = None
     """DSA IndexCache sub-configuration. If set, sparse-attention top-k indices are reused across decoder layers per the configured schedule (mirrors vLLM's IndexCache HF overrides). If None, every layer recomputes its own indices."""
@@ -225,22 +341,8 @@ class ModelConfig(BaseModelConfig):
     debug: DebugModelConfig = DebugModelConfig()
     """Debugging knobs for the model and distributed training."""
 
-    fused_lm_head_token_chunk_size: int | Literal["disabled"] = 1024
-    """Flattened token chunk size for the fused LM head. ``int >= 1`` sets the tokens per LM-head chunk explicitly; ``disabled`` uses the vanilla LM head. SFT training silently disables this (not supported yet)."""
-
-    @model_validator(mode="after")
-    def trust_remote_code_only_with_hf(self):
-        """Trust remote code only if the model is from HF."""
-        if self.trust_remote_code:
-            if self.impl not in ("hf", "auto"):
-                raise ValueError("Trust remote code is only supported with the HF implementation or auto mode.")
-        return self
-
-    @model_validator(mode="after")
-    def vlm_only_with_custom_impl(self):
-        if self.vlm is not None and self.impl != "custom":
-            raise ValueError("VLM training requires model.impl='custom'")
-        return self
+    fused_lm_head_token_chunk_size: int | Literal["disabled"] = 8192
+    """Flattened token chunk size for the fused LM head. ``int >= 1`` sets the tokens per LM-head chunk explicitly; ``disabled`` uses the vanilla LM head. In SFT the fused head computes the summed cross-entropy and its gradients chunk by chunk, holding one chunk's full-vocab logits at a time."""
 
     @model_validator(mode="after")
     def vlm_cp_requires_ulysses(self):
@@ -252,11 +354,6 @@ class ModelConfig(BaseModelConfig):
     def validate_cp(self):
         if self.cp > 1 and self.attn not in ["flash_attention_2", "flash_attention_3", "flash_attention_4", "auto"]:
             raise ValueError("CP is only supported with flash attention 2, 3, or 4")
-        if self.cp > 1 and self.impl not in ("custom", "auto"):
-            raise ValueError(
-                "Context parallelism requires model.impl='custom' or 'auto' "
-                "(resolved to a custom PrimeRL implementation)"
-            )
         return self
 
     @model_validator(mode="after")
@@ -267,44 +364,29 @@ class ModelConfig(BaseModelConfig):
         return self
 
     @model_validator(mode="after")
-    def selective_ac_only_with_custom_impl(self):
-        if self.ac is not None and self.ac.mode == "selective" and self.impl not in ("custom", "auto"):
-            raise ValueError("Selective activation checkpointing requires model.impl='custom' or 'auto'")
-        return self
-
-    @model_validator(mode="after")
     def cpu_offload_mutual_exclusion(self):
-        if self.fsdp_cpu_offload and self.optim_cpu_offload:
-            raise ValueError("Cannot enable both fsdp_cpu_offload and optim_cpu_offload. Use one or the other.")
+        if self.fsdp_cpu_offload and (self.optim_cpu_offload or self.full_offload):
+            raise ValueError("Cannot combine fsdp_cpu_offload with optimizer CPU offloading.")
+        if self.optim_cpu_offload and self.full_offload:
+            raise ValueError(
+                "Cannot enable both optim_cpu_offload and full_offload. "
+                "Set optim_cpu_offload=false when enabling full optimizer offload."
+            )
         return self
 
     @model_validator(mode="after")
-    def flash_attention_4_only_with_custom_impl(self):
-        # "auto" may resolve to FA4 on Blackwell, so apply the same impl constraint.
-        if self.attn in ("flash_attention_4", "auto") and self.impl not in ("custom", "auto"):
-            raise ValueError("Flash attention 4 is only supported with model.impl='custom' or 'auto'")
-        return self
-
-    @model_validator(mode="after")
-    def quantization_only_with_custom_impl(self):
-        if self.quantization is not None and self.impl not in ("custom", "auto"):
-            raise ValueError(f"{self.quantization.type} training is only supported with model.impl='custom' or 'auto'.")
-        return self
-
-    @model_validator(mode="after")
-    def validate_ep_comm_backend(self):
-        if self.ep_comm_backend == "torch":
+    def validate_moe_runtime(self):
+        if self.ep == 1:
             return self
 
-        if isinstance(self.ep, int) and self.ep <= 1:
-            raise ValueError(f"model.ep_comm_backend='{self.ep_comm_backend}' requires model.ep > 1.")
-
-        return self
-
-    @model_validator(mode="after")
-    def mxfp8_only_with_torch_ep_backend(self):
-        if isinstance(self.quantization, MXFP8Config) and self.ep_comm_backend != "torch":
-            raise ValueError("MXFP8 quantization requires model.ep_comm_backend='torch'.")
+        compute = self.moe.compute
+        dispatch = self.moe.dispatch
+        if isinstance(dispatch, DeepEPMoEDispatchConfig):
+            if isinstance(compute, MXFP8MoEComputeConfig):
+                raise ValueError("MXFP8 expert compute does not support DeepEP dispatch.")
+        elif dispatch.transport == "mxfp8":
+            if not isinstance(compute, MXFP8MoEComputeConfig):
+                raise ValueError("MXFP8 transport requires model.moe.compute.type='mxfp8'.")
         return self
 
 
@@ -351,25 +433,37 @@ SchedulerConfig: TypeAlias = Annotated[
 ]
 
 
+def validate_scheduler(scheduler: SchedulerConfig, max_steps: int | None) -> None:
+    """Check scheduler phases against max_steps so misconfigurations fail at config time."""
+    if isinstance(scheduler, LinearSchedulerConfig):
+        if scheduler.warmup_steps == 0 and scheduler.decay_steps == 0:
+            raise ValueError(
+                "Linear scheduler requires warmup_steps > 0 or decay_steps > 0 (use the constant scheduler instead)"
+            )
+        if scheduler.decay_steps > 0:
+            if max_steps is None:
+                raise ValueError("Must specify max_steps when using a linear scheduler with decay_steps > 0")
+            if scheduler.warmup_steps + scheduler.decay_steps > max_steps:
+                raise ValueError(
+                    f"warmup_steps ({scheduler.warmup_steps}) + decay_steps ({scheduler.decay_steps}) "
+                    f"must not exceed max_steps ({max_steps})"
+                )
+    if isinstance(scheduler, CosineSchedulerConfig):
+        if max_steps is None:
+            raise ValueError("Must specify max_steps when using a cosine scheduler")
+        if scheduler.warmup_steps >= max_steps:
+            raise ValueError(f"warmup_steps ({scheduler.warmup_steps}) must be less than max_steps ({max_steps})")
+
+
 class BaseOptimizerConfig(BaseConfig):
     lr: float = Field(1e-6, ge=0)
     """Peak learning rate."""
 
-    weight_decay: float = Field(0.01, ge=0)
-    """L2 weight-decay coefficient."""
+    weight_decay: Annotated[float, Field(ge=0)] | Literal["auto"] = "auto"
+    """L2 weight-decay coefficient. ``"auto"`` (default) resolves to ``0.0`` for RL and ``0.01`` for SFT."""
 
     max_norm: float | None = Field(1.0, ge=0)
     """Maximum gradient norm to clip to. If None, gradient clipping is disabled."""
-
-
-class SGDConfig(BaseOptimizerConfig):
-    type: Literal["sgd"] = "sgd"
-
-    nesterov: bool = True
-    """Use Nesterov momentum."""
-
-    momentum: float = 0.9
-    """SGD momentum factor."""
 
 
 class AdamWConfig(BaseOptimizerConfig):
@@ -399,49 +493,21 @@ class SignSGDConfig(BaseOptimizerConfig):
     type: Literal["sign_sgd"] = "sign_sgd"
 
 
-OptimizerConfig: TypeAlias = Annotated[
-    SGDConfig | AdamWConfig | MuonConfig | SignSGDConfig, Field(discriminator="type")
-]
-
-
-class WeightCheckpointConfig(BaseConfig):
-    save_sharded: bool = True
-    """Save the weight checkpoint in sharded format."""
-
-    save_format: Literal["safetensors", "torch"] = "safetensors"
-    """Weight checkpoint serialization format."""
-
-    save_adapter_separately: bool = False
-    """Save LoRA adapters separately before merging into full model weights."""
+OptimizerConfig: TypeAlias = Annotated[AdamWConfig | MuonConfig | SignSGDConfig, Field(discriminator="type")]
 
 
 class CheckpointConfig(BaseConfig):
     output_dir: Path | None = None
-    """Override directory for checkpoints and weights. If set, checkpoints and weight snapshots are written here instead of under the trainer ``output_dir`` — useful for writing large checkpoints to a separate storage volume."""
+    """Override directory for checkpoints. If set, checkpoints are written here instead of under the trainer ``output_dir`` — useful for writing large checkpoints to a separate storage volume."""
 
     interval: int | None = Field(None, ge=1)
     """Interval at which to save the training checkpoint. If None, only checkpoints at the end of training."""
-
-    weights: WeightCheckpointConfig | None = WeightCheckpointConfig()
-    """Weight-checkpoint sub-configuration. If None, no HF-compatible weight checkpoints are written."""
-
-    skip_gather_master_weights: bool = False
-    """Skip gathering and saving HF-compatible weight checkpoints. Useful for large models where the gather is expensive and only DCP checkpoints are needed."""
-
-    weights_only: bool = False
-    """Save only weight checkpoints (no optimizer/scheduler state). Much faster and smaller than full checkpoints, but cannot resume training."""
-
-    resume_step: int | None = Field(None, ge=-1)
-    """Step to resume training from. None starts from scratch; ``-1`` restarts from the latest checkpoint available."""
 
     keep_last: int | None = Field(None, ge=1)
     """Keep at most this many recent step checkpoints on disk. If None, never clean old checkpoints based on recency."""
 
     keep_interval: int | None = Field(None, ge=1)
     """Keep checkpoints at every N steps permanently (e.g. ``keep_interval=100`` keeps step 100, 200, ...). If None, no interval-based keeping."""
-
-    skip_progress: bool = False
-    """Skip loading the progress from checkpoint."""
 
     skip_scheduler: bool = False
     """Skip loading the scheduler from checkpoint."""
@@ -453,32 +519,70 @@ class CheckpointConfig(BaseConfig):
     """Skip loading the optimizer state from checkpoint."""
 
 
-class DefaultLossConfig(BaseConfig):
-    type: Literal["default"] = "default"
-
-    dppo_mask_low: float = Field(0.2, ge=0)
-    """Lower DPPO masking threshold."""
-
-    dppo_mask_high: float = Field(0.2, ge=0)
-    """Upper DPPO masking threshold."""
-
-    adv_tau: float = Field(1.0, ge=0)
-    """Temperature for the advantage term."""
-
-    kl_tau: float = Field(1e-3, ge=0)
-    """Temperature for the KL term."""
-
-
 class IPOLossConfig(BaseConfig):
     type: Literal["ipo"] = "ipo"
-    ipo_threshold: float = Field(0.1, ge=0)
-    """Upper DPPO masking threshold."""
+    eps: float = Field(0.3, ge=0)
+    """Maximum absolute probability change before a token is masked."""
+
+    max_importance_ratio: float = Field(1e4, ge=1, allow_inf_nan=False)
+    """Cap the importance weight of accepted tokens while preserving its policy gradient."""
 
     adv_tau: float = Field(1.0, ge=0)
     """Temperature for the advantage term."""
 
-    kl_tau: float = Field(1e-3, ge=0)
-    """Temperature for the KL term."""
+
+class IcePopLossConfig(BaseConfig):
+    type: Literal["icepop"] = "icepop"
+
+    ratio_low: float = Field(0.2, gt=0)
+    """Lower accepted trainer-to-inference probability ratio."""
+
+    ratio_high: float = Field(5.0, gt=0)
+    """Upper accepted trainer-to-inference probability ratio."""
+
+    adv_tau: float = Field(1.0, ge=0)
+    """Temperature for the advantage term."""
+
+    @model_validator(mode="after")
+    def validate_ratio_bounds(self):
+        if self.ratio_low > self.ratio_high:
+            raise ValueError("ratio_low must not exceed ratio_high")
+        return self
+
+
+class PPOLossConfig(BaseConfig):
+    type: Literal["ppo"] = "ppo"
+
+    ratio_low: float = Field(0.8, gt=0, le=1, allow_inf_nan=False)
+    """Lower ratio bound for the clipped surrogate."""
+
+    ratio_high: float = Field(1.2, ge=1, allow_inf_nan=False)
+    """Upper ratio bound for the clipped surrogate."""
+
+    max_importance_ratio: float = Field(1e4, ge=1, allow_inf_nan=False)
+    """Cap the unbounded side of the surrogate while preserving its gradient."""
+
+    adv_tau: float = Field(1.0, ge=0)
+    """Temperature for the advantage term."""
+
+    @model_validator(mode="after")
+    def validate_max_importance_ratio(self):
+        if self.max_importance_ratio < self.ratio_high:
+            raise ValueError("max_importance_ratio must be at least ratio_high")
+        return self
+
+
+class CISPOLossConfig(BaseConfig):
+    type: Literal["cispo"] = "cispo"
+
+    ratio_low: float = Field(0.0, ge=0, le=1, allow_inf_nan=False)
+    """Lower bound for the detached importance weight; zero disables lower clipping."""
+
+    ratio_high: float = Field(5.0, ge=1, allow_inf_nan=False)
+    """Upper bound for the detached importance weight."""
+
+    adv_tau: float = Field(1.0, ge=0)
+    """Temperature for the advantage term."""
 
 
 class CustomLossConfig(BaseConfig):
@@ -491,7 +595,9 @@ class CustomLossConfig(BaseConfig):
     """Kwargs forwarded to the loss function."""
 
 
-LossConfig: TypeAlias = Annotated[DefaultLossConfig | IPOLossConfig | CustomLossConfig, Field(discriminator="type")]
+LossConfig: TypeAlias = Annotated[
+    IPOLossConfig | IcePopLossConfig | PPOLossConfig | CISPOLossConfig | CustomLossConfig, Field(discriminator="type")
+]
 
 
 class FakeDataLoaderConfig(BaseConfig):
@@ -507,61 +613,6 @@ class DataLoaderConfig(BaseConfig):
     """Use a fake data loader sampling random micro-batches (for debugging)."""
 
 
-class BaseWeightBroadcastConfig(BaseConfig):
-    pass
-
-
-class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
-    type: Literal["filesystem"] = "filesystem"
-
-    save_sharded: bool = True
-    """Save the weight checkpoint in sharded format."""
-
-    save_format: Literal["safetensors", "torch"] = "safetensors"
-    """Weight checkpoint serialization format."""
-
-
-class InMemoryWeightBroadcastConfig(BaseWeightBroadcastConfig):
-    host: str = "localhost"
-    """Weight transfer host."""
-
-    port: int
-    """Weight transfer port."""
-
-    timeout: int = 1200
-    """Weight transfer timeout in seconds."""
-
-    # TODO: Should not be configurable, but auto-inferred
-    inference_world_size: int = 1
-    """Number of inference workers."""
-
-
-class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
-    type: Literal["nccl"] = "nccl"
-
-    port: int = 29501
-    """Port for the NCCL broadcast rendezvous."""
-
-    quantize_in_weight_transfer: bool = False
-    """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
-
-
-class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
-    type: Literal["nixl"] = "nixl"
-
-    port: int = 8001
-    """ModelExpress gRPC port."""
-
-    session_id: str = "default"
-    """ModelExpress session ID."""
-
-
-WeightBroadcastConfig: TypeAlias = Annotated[
-    FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | NIXLWeightBroadcastConfig,
-    Field(discriminator="type"),
-]
-
-
 class TrainerConfig(BaseConfig):
     model: ModelConfig = ModelConfig()
 
@@ -569,7 +620,7 @@ class TrainerConfig(BaseConfig):
 
     data: DataLoaderConfig = DataLoaderConfig()
 
-    loss: LossConfig = DefaultLossConfig()
+    loss: LossConfig = IPOLossConfig()
     """Loss config for the rl loss component (see ``setup_rl_loss_fn``). The ce / ref_kl components are fixed and do not read this."""
 
     optim: OptimizerConfig = AdamWConfig()
@@ -577,6 +628,9 @@ class TrainerConfig(BaseConfig):
     scheduler: SchedulerConfig = ConstantSchedulerConfig()
 
     ckpt: CheckpointConfig | None = None
+
+    resume: ResumeConfig | None = None
+    """Resume training from a checkpoint. None starts from scratch; an empty block resumes from the latest checkpoint, ``resume.step`` from that step, ``resume.dir`` from an external checkpoint step directory. Without ``ckpt`` the run loads but saves no new checkpoints."""
     """Full training-state checkpoint configuration (model + optimizer + scheduler). If None, no resume-capable checkpoints are written."""
 
     weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
@@ -587,13 +641,11 @@ class TrainerConfig(BaseConfig):
 
     log: TrainerLogConfig = TrainerLogConfig()
 
-    wandb: WandbConfig | None = None
+    monitors: MonitorsConfig = MonitorsConfig()
+    """Metric monitors (``monitors.wandb``, ``monitors.file``)."""
 
-    file_monitor: FileMonitorConfig | None = None
-    """Local JSONL metric sink. If set, trainer metrics are appended to ``<output_dir>/metrics.jsonl``."""
-
-    output_dir: Path = Path("outputs")
-    """Directory to write outputs to — checkpoints, weights, rollouts, and logs are written as subdirectories. Should be a persistent directory with enough disk space and unique per experiment running on a single node."""
+    output_dir: Path = Field(default_factory=default_output_dir)
+    """Directory to write outputs to — checkpoints, weights, rollouts, and logs are written as subdirectories. Should be a persistent directory with enough disk space and unique per experiment running on a single node. Defaults to ``$PRL_OUTPUT_DIR`` if set, else ``outputs``."""
 
     matmul_precision: Literal["highest", "high", "medium"] = "high"
     """Precision for float32 matrix multiplications. ``highest`` is full FP32 (required on ROCm/AMD GPUs to avoid catastrophic precision loss in softmax over large vocabularies). ``high`` enables TF32 on NVIDIA GPUs for a speedup with minor precision tradeoff. See ``torch.set_float32_matmul_precision``."""
@@ -607,9 +659,6 @@ class TrainerConfig(BaseConfig):
     memory_profiler_path: Path | None = None
     """Path to write the memory profile to."""
 
-    bench: BenchConfig | None = None
-    """Benchmark-mode configuration. When set, ``max_steps`` is forced to 4 and fake data is used."""
-
     gc: GCConfig | None = GCConfig()
     """Garbage collection config. Disables automatic GC and runs deterministic collections every N steps to avoid stragglers. Set to null to use Python's default GC behavior."""
 
@@ -622,21 +671,26 @@ class TrainerConfig(BaseConfig):
     heartbeat: HeartbeatConfig | None = None
     """BetterStack heartbeat configuration for monitoring training progress."""
 
-    metrics_server: MetricsServerConfig | None = None
-    """Prometheus metrics server configuration. If set, exposes a ``/metrics`` endpoint for scraping."""
-
-    max_concurrent_runs: int = Field(1, ge=1)
-    """Maximum number of concurrent runs to allow. If 1, only one run may run at a time."""
-
-    enable_token_export: bool = False
-    """Opt-in per-token JSONL export for rollout debugging. When enabled, writes token ids and aligned trainer metrics after each forward pass."""
-
     env_vars: EnvVars = {}
     """Extra environment variables for the trainer process(es). Merged on top of the launcher defaults."""
 
     @model_validator(mode="after")
+    def resolve_moe_router_dtype_auto(self):
+        """Resolve ``model.moe_router_dtype='auto'``: RL routes in fp32, matching the fp32-routed checkpoints it trains from (e.g. GLM-5.x)."""
+        if self.model.moe_router_dtype == "auto":
+            self.model.moe_router_dtype = "float32"
+        return self
+
+    @model_validator(mode="after")
+    def resolve_weight_decay_auto(self):
+        """Resolve ``optim.weight_decay='auto'``: RL optimizes the reward objective, not a fixed dataset — L2 decay toward zero fights it, so default to no weight decay."""
+        if self.optim.weight_decay == "auto":
+            self.optim.weight_decay = 0.0
+        return self
+
+    @model_validator(mode="after")
     def deepep_disables_grad_clipping(self):
-        if self.model.ep_comm_backend == "deepep" and self.optim.max_norm is not None:
+        if self.model.ep != 1 and self.model.moe.dispatch.type == "deepep" and self.optim.max_norm is not None:
             warnings.warn(
                 "Gradient clipping is not compatible with DeepEP. "
                 "Automatically setting optim.max_norm to None (disabled).",
@@ -646,13 +700,20 @@ class TrainerConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
-    def vlms_require_bfloat16(self):
-        if self.model.vlm is not None and (
-            self.model.optimization_dtype != "bfloat16" or self.model.reduce_dtype != "bfloat16"
-        ):
-            raise ValueError(
-                "VLM models must use optimization_dtype='bfloat16' and reduce_dtype='bfloat16' to match vLLM inference."
+    def full_optimizer_offload_requires_supported_optimizer(self):
+        if self.model.full_offload and self.optim.type not in ("adamw", "sign_sgd"):
+            raise ValueError("Full optimizer offload only supports AdamW and SignSGD")
+        return self
+
+    @model_validator(mode="after")
+    def full_optimizer_offload_disables_grad_clipping(self):
+        if self.model.full_offload and self.optim.max_norm is not None:
+            warnings.warn(
+                "Gradient clipping prevents optimizer-in-backward overlap with CPU optimizer offload. "
+                "Automatically setting optim.max_norm to None (disabled).",
+                stacklevel=1,
             )
+            self.optim.max_norm = None
         return self
 
     @model_validator(mode="after")
@@ -662,16 +723,6 @@ class TrainerConfig(BaseConfig):
                 "freeze_vision_encoder=false is incompatible with LoRA. "
                 "LoRA freezes all non-adapter parameters including the vision encoder."
             )
-        return self
-
-    @model_validator(mode="after")
-    def auto_setup_bench(self):
-        if self.bench is not None:
-            self.max_steps = 4  # 1 Warmup + 3 Benchmark
-            if not self.data.fake:
-                self.data.fake = FakeDataLoaderConfig()
-            if self.ckpt:  # Do not checkpoint
-                self.ckpt = None
         return self
 
     @model_validator(mode="after")
@@ -686,14 +737,8 @@ class TrainerConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
-    def validate_lora_adapter_saving(self):
-        if self.ckpt and self.ckpt.weights and self.ckpt.weights.save_adapter_separately:
-            lora_enabled = self.model and self.model.lora
-            if not lora_enabled:
-                raise ValueError(
-                    "save_adapter_separately=True requires LoRA to be enabled. "
-                    "Set model.lora or disable save_adapter_separately."
-                )
+    def validate_scheduler_steps(self):
+        validate_scheduler(self.scheduler, self.max_steps)
         return self
 
     @model_validator(mode="after")
@@ -703,15 +748,17 @@ class TrainerConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
-    def validate_optim_cpu_offload_single_run(self):
-        if self.model.optim_cpu_offload and self.max_concurrent_runs > 1:
-            raise ValueError("Optimizer CPU offload is not supported with max_concurrent_runs > 1")
-        return self
-
-    @model_validator(mode="after")
     def validate_lora_broadcast(self):
         if self.model.lora is not None and self.weight_broadcast.type in ("nccl", "nixl"):
-            raise ValueError("In-memory weight broadcast does not support LoRA yet.")
+            raise ValueError(
+                "LoRA requires weight_broadcast.type = 'filesystem': vLLM loads adapters only from a "
+                "PEFT-shaped directory on disk - in-memory transports have no disk artifact to load from."
+            )
+        if self.model.lora is not None and self.model.lora.modules_to_save and self.data.fake is None:
+            raise ValueError(
+                "model.lora.modules_to_save cannot be served: the weight broadcast ships only the "
+                "adapter tensors, so fully-trained modules would silently diverge from inference."
+            )
         return self
 
     @model_validator(mode="after")
@@ -720,18 +767,4 @@ class TrainerConfig(BaseConfig):
             self.tokenizer.name = self.model.name
         if self.tokenizer.trust_remote_code is None:
             self.tokenizer.trust_remote_code = self.model.trust_remote_code
-        return self
-
-    @model_validator(mode="after")
-    def ep_only_with_custom_impl(self):
-        if self.model.ep != 1 and self.model.ep != "auto" and self.model.impl not in ("custom", "auto"):
-            raise ValueError("EP is only supported with the custom implementation or auto mode")
-
-        return self
-
-    @model_validator(mode="after")
-    def router_replay_only_with_custom_impl(self):
-        if self.enable_router_replay and self.model.impl not in ("custom", "auto"):
-            raise ValueError("Router replay is only supported with the custom implementation or auto mode")
-
         return self

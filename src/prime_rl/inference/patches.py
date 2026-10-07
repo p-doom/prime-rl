@@ -1,25 +1,50 @@
-import torch
+import os
 
-from prime_rl.inference.vllm.padded_input_scrub import monkey_patch_vllm_padded_input_scrub
+import torch
 
 
 def apply_shared_vllm_patches():
-    """vLLM general plugin: prime-rl patches that must run in every vLLM process.
+    """vLLM general plugin and the single place prime-rl applies its vLLM patches; vLLM runs it once in every process.
 
-    Registered as a ``vllm.general_plugins`` entry-point so it runs automatically
-    in every vLLM process, including spawned workers. Note vLLM swallows plugin
-    load failures (``load_plugins_by_group`` logs and continues), so a broken
+    vLLM swallows plugin load failures (``load_plugins_by_group`` logs and continues), so a broken
     entry-point target silently skips ALL of these patches.
     """
+    from prime_rl.inference.vllm.gpt_oss_weight_loading import patch_gpt_oss_weight_loading
+    from prime_rl.inference.vllm.qwen38_weight_loading import patch_qwen38_weight_loading
+
+    patch_gpt_oss_weight_loading()
+    patch_qwen38_weight_loading()
     _patch_lora_key_prefix()
     _patch_qwen35_moe_lora_format()
     monkey_patch_nano_v3_reasoning_parser()
-    monkey_patch_qwen3_coder_param_newline_trim()
     monkey_patch_minimax_m2_think_end_passthrough()
-    monkey_patch_vllm_padded_input_scrub()
-    monkey_patch_return_routed_experts_with_nixl_connector()
     monkey_patch_kv_xfer_finished_tolerate_freed()
     monkey_patch_online_fp8_parameter_cast()
+    monkey_patch_deepseek_v4_allowed_layer_types()
+    monkey_patch_tokenize_params_validation()
+    monkey_patch_strip_routed_experts_from_chat()
+    monkey_patch_dp_coordinator_startup_timeout()
+    monkey_patch_minimax_m2_for_lora()
+    # Set by `server()` when the LoRA target modules include no expert layers.
+    if os.environ.get("PRIME_NO_MOE_LORA") == "1":
+        monkey_patch_no_moe_lora()
+
+
+def monkey_patch_deepseek_v4_allowed_layer_types():
+    """Let vLLM's `DeepseekV4Config` construct under a transformers pin below 5.15.
+
+    `vllm/transformers_utils/configs/deepseek_v4.py` leaves `layer_types` to
+    `PretrainedConfig`, whose validator checks it against a vocabulary that only gained V4's
+    compressed attention names in transformers 5.15, so `AutoConfig.from_pretrained` on any
+    DeepSeek V4 checkpoint raises. vLLM declares `transformers>=5.5.3`, so this is a gap in
+    upstream's own version floor rather than something prime-rl introduced.
+
+    `EngineArgs.__post_init__` loads general plugins before `create_model_config`, which is why
+    patching here is early enough. The trainer applies the same shim on its own import path.
+    """
+    from prime_rl.utils.transformers_compat import allow_deepseek_v4_layer_types
+
+    allow_deepseek_v4_layer_types()
 
 
 def monkey_patch_online_fp8_parameter_cast():
@@ -124,57 +149,6 @@ def monkey_patch_nano_v3_reasoning_parser():
     ReasoningParserManager.register_module("nano_v3", module=NanoV3ReasoningParser)
 
 
-def monkey_patch_qwen3_coder_param_newline_trim():
-    """Restore vLLM 0.23's single-newline trim for qwen3_coder tool parameters.
-
-    vLLM 0.24's parser engine applies a full ``.strip()`` to every parameter
-    value in ``_qwen3_arg_converter``; 0.23's ``Qwen3CoderToolParser`` trimmed
-    exactly one leading and one trailing newline. A full strip corrupts
-    whitespace-significant string parameters (str_replace-style
-    ``old_str``/``new_str``, file content with an indented first line, values
-    with intentional trailing newlines), silently changing tool execution and
-    rewards for agentic runs. Copy of ``_qwen3_arg_converter`` with only the
-    trim changed. Also covers ``nemotron_v3``, which reuses ``qwen3_config``.
-    """
-    import json
-
-    from vllm.parser import qwen3
-
-    def _trim_one_newline(value: str) -> str:
-        if value.startswith("\n"):
-            value = value[1:]
-        if value.endswith("\n"):
-            value = value[:-1]
-        return value
-
-    def _patched_arg_converter(raw_args: str, partial: bool) -> str:
-        params: dict[str, object] = {}
-
-        for match in qwen3._PARAM_RE.finditer(raw_args):
-            name = match.group(1)
-            value = match.group(2)
-            ## START PATCHED CODE (upstream: value.strip())
-            params[name] = _trim_one_newline(value)
-            ## END PATCHED CODE
-
-        if partial:
-            remaining = qwen3._PARAM_RE.sub("", raw_args)
-            m = qwen3._PARTIAL_PARAM_RE.search(remaining)
-            if m:
-                name = m.group(1)
-                value = m.group(2)
-                if name:
-                    ## START PATCHED CODE (upstream: value.strip())
-                    params[name] = _trim_one_newline(value)
-                    ## END PATCHED CODE
-
-        return json.dumps(params, ensure_ascii=False)
-
-    qwen3._qwen3_arg_converter = _patched_arg_converter
-    # qwen3_config captures the converter when first built; drop any cached configs.
-    qwen3.qwen3_config.cache_clear()
-
-
 def monkey_patch_minimax_m2_think_end_passthrough():
     """Keep the literal ``</think>`` in MiniMax-M2 content on tool-calling turns.
 
@@ -207,50 +181,6 @@ def monkey_patch_minimax_m2_think_end_passthrough():
         )
 
     minimax_m2.minimax_m2_config = _patched_config
-
-
-def monkey_patch_return_routed_experts_with_nixl_connector():
-    from vllm import envs
-    from vllm.config.vllm import VllmConfig
-    from vllm.logger import init_logger
-
-    logger = init_logger(__name__)
-    original_post_init = VllmConfig.__post_init__
-
-    if getattr(original_post_init, "_prime_rl_allows_nixl_routed_experts", False):
-        return
-
-    def _is_nixl_routed_experts_pd_config(config: VllmConfig) -> bool:
-        kv_transfer_config = config.kv_transfer_config
-        return (
-            config.model_config is not None
-            and config.model_config.enable_return_routed_experts
-            and kv_transfer_config is not None
-            and kv_transfer_config.kv_connector == "NixlConnector"
-            and kv_transfer_config.is_kv_transfer_instance
-        )
-
-    def _post_init(config: VllmConfig):
-        if not _is_nixl_routed_experts_pd_config(config):
-            return original_post_init(config)
-
-        if config.parallel_config.pipeline_parallel_size > 1:
-            raise ValueError("--enable-return-routed-experts is incompatible with pipeline parallelism (PP > 1).")
-        if envs.VLLM_USE_V2_MODEL_RUNNER:
-            raise ValueError("VLLM_USE_V2_MODEL_RUNNER does not yet support: routed experts capture")
-
-        # vLLM rejects every KV connector, but our P/D path uses NIXL and
-        # stitches prefill/decode routed experts in the router. CPU KV offload
-        # remains rejected by prime-rl config validation.
-        config.model_config.enable_return_routed_experts = False
-        try:
-            return original_post_init(config)
-        finally:
-            config.model_config.enable_return_routed_experts = True
-
-    _post_init._prime_rl_allows_nixl_routed_experts = True
-    VllmConfig.__post_init__ = _post_init
-    logger.warning("Enabled vLLM routed-experts capture with NIXL connector patch.")
 
 
 def monkey_patch_strip_routed_experts_from_chat():
@@ -396,6 +326,7 @@ def _patch_lora_key_prefix():
                 if skip_prefixes and cls._should_skip_module(lora_module, skip_prefixes):
                     continue
                 module_name, _ = parse_fine_tuned_lora_name(lora_module, weights_mapper)
+                base_name = module_name.rsplit(".", 1)[-1]
                 # Case for expert lora weights.
                 ## START PATCHED CODE (upstream only accepts the qualified form)
                 if ".experts" in module_name:
@@ -405,7 +336,7 @@ def _patch_lora_key_prefix():
                         unexpected_modules.append(module_name)
                 ## END PATCHED CODE
 
-                elif module_name.rsplit(".", 1)[-1] not in expected_lora_modules:
+                elif base_name not in expected_lora_modules and base_name not in (peft_helper.modules_to_save or ()):
                     unexpected_modules.append(module_name)
 
             if unexpected_modules:
@@ -548,8 +479,8 @@ def monkey_patch_minimax_m2_for_lora():
     """Patch vLLM's MiniMaxM2 model for LoRA compatibility.
 
     These patches are only needed when using LoRA with MiniMax M2 but are safe
-    to apply unconditionally (verified with non-LoRA runs). We apply them at
-    import time because the worker __init__ runs before the vLLM config is
+    to apply unconditionally (verified with non-LoRA runs). We apply them
+    unconditionally because the vLLM plugin runs before the vLLM config is
     available, so we can't check if LoRA is enabled.
 
     Problem 1 — Gate dtype mismatch:
@@ -612,32 +543,6 @@ def monkey_patch_minimax_m2_for_lora():
     )
 
 
-def monkey_patch_harmony_stop_token_propagation():
-    """Fix: vLLM doesn't merge harmony stop tokens into per-request SamplingParams.
-
-    The harmony mode sets stop_token_ids (including <|call|> and <|return|>) in
-    default_sampling_params at server init, but ChatCompletionRequest.to_sampling_params()
-    ignores them, using only self.stop_token_ids (which defaults to []).
-
-    Upstream: https://github.com/vllm-project/vllm/issues/22519
-    """
-    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-
-    _original_to_sampling_params = ChatCompletionRequest.to_sampling_params
-
-    def _patched_to_sampling_params(self, max_tokens, default_sampling_params):
-        params = _original_to_sampling_params(self, max_tokens, default_sampling_params)
-        # Merge harmony stop tokens from default_sampling_params
-        default_stop_ids = default_sampling_params.get("stop_token_ids", [])
-        if default_stop_ids:
-            existing = set(params.stop_token_ids or [])
-            merged = list(existing | set(default_stop_ids))
-            params.stop_token_ids = merged
-        return params
-
-    ChatCompletionRequest.to_sampling_params = _patched_to_sampling_params
-
-
 def monkey_patch_no_moe_lora():
     """This disables LoRA for MoE layers and makes them pick better kernels.
 
@@ -656,107 +561,6 @@ def monkey_patch_no_moe_lora():
         self.is_lora_enabled = False
 
     FusedMoEConfig.__post_init__ = _patched__post_init__
-
-
-def monkey_patch_fp32_lm_head():
-    """Run the lm_head projection in fp32, via a native bf16xbf16 -> fp32 GEMM.
-
-    Uses ``torch.mm(..., out_dtype=torch.float32)`` (PyTorch >= 2.10) so the
-    matmul accumulates and emits fp32 directly without zero-padding the bf16
-    operands or maintaining a separate fp32 weight copy. This avoids the
-    epilogue truncation to bf16 that `F.linear(bf16, bf16)` does, which is
-    where lm_head precision actually leaks before the sampler's softmax.
-
-    Activated by setting ``additional_config["fp32_lm_head"] = True`` on the
-    vLLM namespace; the launcher does this when ``inference.enable_fp32_lm_head``
-    is set. The flag is captured once on ``LogitsProcessor.__init__`` (where
-    vLLM guarantees a ``set_current_vllm_config()`` context) and stored on the
-    instance — reading it from ``_get_logits`` during serving doesn't work
-    because vLLM doesn't keep the context set during forwards.
-
-    Tracks vllm-project/vllm#24567 (which uses the operand-upcast approach).
-    Per @Jackmin801 on PR #2438, native ``out_dtype=fp32`` mm is more efficient
-    and just as correct.
-    """
-    import torch
-    from vllm.config import get_current_vllm_config
-    from vllm.logger import init_logger
-    from vllm.model_executor.layers.logits_processor import LogitsProcessor
-
-    logger = init_logger(__name__)
-
-    _original_init = LogitsProcessor.__init__
-    _original_get_logits = LogitsProcessor._get_logits
-
-    def _patched_init(self, *args, **kwargs):
-        _original_init(self, *args, **kwargs)
-        vllm_config = get_current_vllm_config()
-        additional_config = vllm_config.additional_config or {}
-        self._fp32_lm_head_enabled = additional_config.get("fp32_lm_head", False)
-        if self._fp32_lm_head_enabled:
-            logger.warning("fp32 lm_head ENABLED for this LogitsProcessor instance.")
-
-    def _patched_get_logits(self, hidden_states, lm_head, embedding_bias):
-        if not getattr(self, "_fp32_lm_head_enabled", False):
-            return _original_get_logits(self, hidden_states, lm_head, embedding_bias)
-
-        # Native bf16xbf16 -> fp32 GEMM. torch.mm requires 2D inputs; vLLM v1's
-        # generative path passes 2D [num_tokens, hidden_size] hidden_states, but
-        # flatten defensively in case some future caller passes 3D.
-        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-        logits = torch.mm(flat, lm_head.weight.t(), out_dtype=torch.float32)
-        if embedding_bias is not None:
-            logits = logits + embedding_bias.to(torch.float32)
-        if hidden_states.dim() > 2:
-            logits = logits.reshape(*hidden_states.shape[:-1], -1)
-
-        logits = self._gather_logits(logits)
-        if logits is not None:
-            logits = logits[..., : self.org_vocab_size]
-        return logits
-
-    LogitsProcessor.__init__ = _patched_init
-    LogitsProcessor._get_logits = _patched_get_logits
-    logger.info("Installed fp32 lm_head patch (native out_dtype=fp32 mm).")
-
-
-def monkey_patch_fp32_router_logits():
-    """Emit fp32 MoE router logits for DeepSeek-family models (incl. GLM-5.x glm_moe_dsa).
-
-    vLLM's DeepseekV2MoE gate is a GateLinear with a bf16 weight and no out_dtype,
-    so router logits are rounded to bf16 before expert scoring. GLM-5.x was trained
-    with fp32 routing (Megatron ``--moe-router-dtype fp32``); upstream now runs its
-    gate fully in fp32 (vllm-project/vllm#47410, not in the pinned release).
-    Setting ``out_dtype=float32`` routes the gate through GateLinear's cuBLAS
-    bf16xbf16->fp32 tier: same GEMM, but the fp32 accumulator is written out
-    unrounded. Unlike the upstream PR, the gate weight stays bf16, so the LoRA
-    Triton kernel dtype assert and the bf16 weight-broadcast path are unaffected.
-
-    Activated by ``additional_config["fp32_router_logits"] = True``; the launcher
-    sets this when ``inference.enable_fp32_router_logits`` is set. The flag is read
-    at module construction, where vLLM guarantees a ``set_current_vllm_config()``
-    context. No-op if something else already set an out_dtype (e.g. the ROCm AITER
-    branch, whose kernel wants matching dtypes).
-    """
-    import torch
-    from vllm.config import get_current_vllm_config
-    from vllm.logger import init_logger
-    from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE
-
-    logger = init_logger(__name__)
-
-    _original_init = DeepseekV2MoE.__init__
-
-    def _patched_init(self, *args, **kwargs):
-        _original_init(self, *args, **kwargs)
-        additional_config = get_current_vllm_config().additional_config or {}
-        if not additional_config.get("fp32_router_logits", False):
-            return
-        if self.gate.out_dtype is None:
-            self.gate.set_out_dtype(torch.float32)
-
-    DeepseekV2MoE.__init__ = _patched_init
-    logger.info("Installed fp32 router logits patch (self-gates on additional_config['fp32_router_logits']).")
 
 
 def monkey_patch_dp_coordinator_startup_timeout():

@@ -27,7 +27,7 @@ git diff --stat "$fork_base"..origin/downstream/main
 git diff origin/main...origin/downstream/main
 ```
 
-The current intentional overlay consists only of the six changes below. The
+The current intentional overlay consists only of the five changes below. The
 asset-root requirement for projects that embed PrimeRL is tracked separately
 because it is not a change to this fork.
 
@@ -60,9 +60,9 @@ the local/single-node launch path, the implementation:
 2. replaces only loopback and unspecified hosts in
    `orchestrator.model.client.base_url`;
 3. leaves already-remote URLs unchanged;
-4. preserves scheme, credentials, port, path, query, fragment, URL order, and
-   IPv6 bracket syntax; and
-5. saves the original local URLs in `admin_base_url` when that field was not
+4. preserves scheme, credentials, port, path, query, fragment, and IPv6
+   bracket syntax; and
+5. saves the original local URL in `admin_base_url` when that field was not
    explicitly configured, so launcher-local administrative traffic remains
    local.
 
@@ -97,8 +97,11 @@ baseline is not available on the HAICORE compute environment, so the fork pins
 the last validated compatible release:
 
 ```toml
-mooncake-transfer-engine==0.3.8.post1
+mooncake-transfer-engine==0.3.8.post1 ; sys_platform == 'linux'
 ```
+
+Upstream declares Mooncake in the `gpu` optional dependency group, so the pin
+lives there too.
 
 The manifest and lockfile must agree on that exact version. During a merge,
 take upstream dependency updates for unrelated packages, restore the exact
@@ -111,45 +114,11 @@ the relevant Mooncake runtime path on every target compute architecture through
 Slurm. Once the cluster baseline or upstream wheel compatibility makes the pin
 unnecessary, update `pyproject.toml` and `uv.lock` in the same change.
 
-## Serialize optional fields in nested dataclasses
-
-Source: [downstream PR #6](https://github.com/p-doom/prime-rl/pull/6)
-
-File:
-
-- `packages/prime-rl-configs/src/prime_rl/utils/config.py`
-
-The OSWorld harness resolves a standard-library dataclass,
-`DesktopPoolConfig`, inside a Pydantic configuration before PrimeRL writes the
-resolved Slurm configuration. The dataclass contains optional paths such as
-`status_dir`, `root_dir`, `runtime_dir`, and `log_runtime_dir`. Pydantic's JSON
-dump turns that dataclass into a dictionary, but the generic serializer
-previously treated it as opaque and passed its `None` values to `tomli_w`, which
-raises `TypeError` because TOML has no null value.
-
-`to_toml_dict()` therefore detects a dataclass paired with a dumped dictionary,
-recursively encodes its non-null values, and omits its null fields. Preserve
-these invariants when upstream refactors configuration serialization:
-
-- detection uses the original attribute, not only the dumped dictionary;
-- nested values still pass through `_encode_value()`;
-- non-null dataclass fields are preserved;
-- null dataclass fields are omitted before `tomli_w` receives them; and
-- Pydantic's separate explicit-`None` round-trip behavior remains unchanged.
-
-Do not replace this with a blanket removal of `None` from every dictionary.
-Pydantic fields explicitly set to `None` use the string `"None"` to survive a
-write/reparse cycle, while optional dataclass defaults must be omitted.
-
-Retire the patch only when upstream has equivalent nested-dataclass handling
-and an actual resolved OSWorld `DesktopPoolConfig` can be written and reparsed
-without losing non-null fields.
-
 ## Use the W&B Workspaces GraphQL client
 
 Files:
 
-- `src/prime_rl/utils/monitor/wandb.py`
+- `src/prime_rl/monitors/wandb/overview.py`
 
 The declared W&B dependency range allows newer SDK releases, including 0.28.1,
 that no longer provide the `wandb_gql` module or the legacy
@@ -175,7 +144,8 @@ supported Workspaces API for discovering saved project views.
 
 Files:
 
-- `src/prime_rl/utils/monitor/wandb.py`
+- `src/prime_rl/monitors/wandb/monitor.py`
+- `tests/unit/utils/test_wandb_monitor.py`
 
 RL launches use one shared W&B run with the orchestrator as the primary writer
 and the trainer as a secondary writer. Upstream passes each component's config
@@ -231,6 +201,16 @@ Do not infer the live fork delta from downstream-only commit subjects alone.
   `#SBATCH --exclusive` from the single-node RL template, but downstream PR #6
   explicitly reverted that change. The current policy remains an exclusive
   single-node RL allocation.
+- [Downstream PR #6](https://github.com/p-doom/prime-rl/pull/6) taught the
+  TOML config serializer to omit null fields of nested dataclasses, such as
+  OSWorld's `DesktopPoolConfig`. The 2026-10-07 sync retired it: upstream now
+  writes resolved configs as JSON, which keeps nulls, so there is no TOML
+  serializer left to patch.
+- [Downstream PR #9](https://github.com/p-doom/prime-rl/pull/9) synchronized
+  upstream as a squash commit, which dropped upstream's ancestry and left the
+  merge base at 2026-07-20. The 2026-10-07 sync is a true merge of upstream
+  `main` whose tree is upstream plus the overlay above, which restores that
+  ancestry. Keep later syncs as merges.
 
 ## Upstream synchronization checklist
 
@@ -270,10 +250,9 @@ Do not infer the live fork delta from downstream-only commit subjects alone.
    - In `inference.py` and `rl.py`, integrate upstream router and launch-flow
      changes while retaining opt-in single-node advertisement before
      subconfiguration serialization.
-   - In `utils/config.py`, retain nested-dataclass null filtering without
-     weakening explicit-`None` handling for Pydantic models.
-   - In `utils/monitor/wandb.py`, keep saved-view queries on the GraphQL client
-     provided by the installed Workspaces package.
+   - In `monitors/wandb/overview.py`, keep saved-view queries on the GraphQL
+     client provided by the installed Workspaces package, and in
+     `monitors/wandb/monitor.py`, keep shared-run configs namespaced by writer.
    - In `install_nixl_from_source.sh`, retain `PRIME_RL_VENV_BIN` and ensure
      every Python package operation targets the selected interpreter.
    - Treat changes to environment/source schemas, model-client URL ownership,
@@ -297,7 +276,7 @@ Do not infer the live fork delta from downstream-only commit subjects alone.
      `uv run pytest -q tests/unit/test_configs.py`;
    - exercise URL rewriting for loopback, unspecified, already-remote, and IPv6
      inputs, including preservation of `admin_base_url`;
-   - serialize a resolved OSWorld configuration containing a
+   - write and reparse a resolved OSWorld configuration containing a
      `DesktopPoolConfig` with both null and non-null optional paths;
    - run a downstream RL `--dry-run` and inspect the generated orchestrator TOML
      and Slurm script; and

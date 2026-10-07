@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Optional
-
-from prime_rl.configs.inference import InferenceConfig
-from prime_rl.configs.orchestrator import OrchestratorConfig
-from prime_rl.configs.trainer import TrainerConfig
+from typing import Any
 
 
 def propagate_shared_fields(data: Any) -> Any:
@@ -68,13 +64,12 @@ def propagate_shared_fields(data: Any) -> Any:
     propagate(
         "model.name",
         "trainer.model.name",
-        "inference.model.name",
+        "inference.vllm.model",
         "orchestrator.model.name",
     )
     propagate(
         "model.vlm",
         "trainer.model.vlm",
-        "inference.model.vlm",
         "orchestrator.model.vlm",
     )
 
@@ -91,25 +86,28 @@ def propagate_shared_fields(data: Any) -> Any:
     # ``orchestrator.ckpt`` has no ``output_dir`` field — trainer-only.
     propagate("ckpt.output_dir", "trainer.ckpt.output_dir")
     propagate("ckpt.interval", "trainer.ckpt.interval", "orchestrator.ckpt.interval")
-    propagate("ckpt.resume_step", "trainer.ckpt.resume_step", "orchestrator.ckpt.resume_step")
     propagate("ckpt.keep_last", "trainer.ckpt.keep_last", "orchestrator.ckpt.keep_last")
     propagate("ckpt.keep_interval", "trainer.ckpt.keep_interval", "orchestrator.ckpt.keep_interval")
 
-    # [wandb] leaves. (Bare empty ``[wandb]`` block enablement is at the end.)
-    # ``wandb.name`` flows verbatim to both sub-configs — shared W&B mode is
+    # [monitors.wandb] leaves. (Bare empty ``[monitors.wandb]`` block enablement is at the end.)
+    # ``monitors.wandb.name`` flows verbatim to both sub-configs — shared W&B mode is
     # always on for the rl entrypoint, so the legacy ``-trainer`` /
     # ``-orchestrator`` suffix split is gone.
-    propagate("wandb.project", "trainer.wandb.project", "orchestrator.wandb.project")
-    propagate("wandb.entity", "trainer.wandb.entity", "orchestrator.wandb.entity")
-    propagate("wandb.name", "trainer.wandb.name", "orchestrator.wandb.name")
-    propagate("wandb.group", "trainer.wandb.group", "orchestrator.wandb.group")
-    propagate("wandb.tags", "trainer.wandb.tags", "orchestrator.wandb.tags")
-    propagate("wandb.offline", "trainer.wandb.offline", "orchestrator.wandb.offline")
+    for leaf in ("project", "entity", "name", "group", "tags", "offline"):
+        propagate(
+            f"monitors.wandb.{leaf}",
+            f"trainer.monitors.wandb.{leaf}",
+            f"orchestrator.monitors.wandb.{leaf}",
+        )
 
-    # [file_monitor] leaf. (Bare empty ``[file_monitor]`` block enablement is at the end.)
-    propagate("file_monitor.filename", "trainer.file_monitor.filename", "orchestrator.file_monitor.filename")
+    # [monitors.file] leaf. (Bare empty ``[monitors.file]`` block enablement is at the end.)
+    propagate("monitors.file.path", "trainer.monitors.file.path", "orchestrator.monitors.file.path")
 
-    # [tokenizer]. ``chat_template`` also flows to ``inference.model`` (vLLM's
+    # [monitors.prime] leaf → orchestrator only (the RL trainer has no platform
+    # integration; the SFT trainer does, but it parses SFTConfig directly).
+    propagate("monitors.prime.name", "orchestrator.monitors.prime.name")
+
+    # [tokenizer]. ``chat_template`` also flows to ``inference.vllm`` (vLLM's
     # ``--chat-template``); ``name`` and ``trust_remote_code`` can legitimately
     # differ between sub-configs (auto-derived from model names, which may
     # differ for FP8-quantized inference variants).
@@ -123,8 +121,10 @@ def propagate_shared_fields(data: Any) -> Any:
         "tokenizer.chat_template",
         "trainer.tokenizer.chat_template",
         "orchestrator.tokenizer.chat_template",
-        "inference.model.chat_template",
+        "inference.vllm.chat_template",
     )
+
+    propagate("resume", "trainer.resume", "orchestrator.resume")
 
     # [rollout_transport] → both sub-configs (host is launcher-injected for zmq multi-node).
     propagate("rollout_transport", "trainer.rollout_transport", "orchestrator.rollout_transport")
@@ -139,49 +139,43 @@ def propagate_shared_fields(data: Any) -> Any:
     # pass (the per-rank inference.toml drops slurm, so each rank still runs locally).
     propagate("slurm", "inference.slurm")
 
-    # output_dir: orchestrator gets a ``/run_default`` subdir so trainer +
-    # orchestrator nest under the same experiment root without colliding.
-    # Conflicts are reported against the *transformed* sub-config value, not
-    # the raw shared path, so the materialized config round-trips cleanly.
-    output_dir = get("output_dir")
-    if output_dir is not None:
-        expected = {
-            "trainer.output_dir": output_dir,
-            "orchestrator.output_dir": f"{output_dir}/run_default",
-        }
-        for sub, expected_value in expected.items():
-            sub_value = get(sub)
-            if sub_value is not None and sub_value != expected_value:
-                conflicts.append(("output_dir", sub))
-            fill(sub, expected_value)
-
-    # Cascade trainer.tokenizer.chat_template → inference.model.chat_template
+    # Cascade trainer.tokenizer.chat_template → inference.vllm.chat_template
     # (vLLM ``--chat-template``). Read trainer's value *after* the shared
     # propagation above so we cover both:
     #   - shared ``[tokenizer] chat_template`` (already filled all three above,
     #     this re-fill is a no-op via fill-if-absent), and
     #   - ``[trainer.tokenizer] chat_template`` set directly without shared
-    #     (only path that reaches inference; ``validate_shared_tokenizer``
+    #     (only path that reaches inference; ``RLConfig.validate_shared_configs``
     #     would otherwise complain about the missing inference value).
     trainer_chat_template = get("trainer.tokenizer.chat_template")
     if trainer_chat_template is not None:
-        fill("inference.model.chat_template", trainer_chat_template)
+        fill("inference.vllm.chat_template", trainer_chat_template)
 
-    # Bare ``[ckpt]`` / ``[wandb]`` block: presence-only signal that enables
-    # the section with defaults on both sub-configs. Necessary because
+    # Bare ``[ckpt]`` / ``[monitors.wandb]`` block: presence-only signal that
+    # enables the section with defaults on both sub-configs. Necessary because
     # ``trainer.ckpt`` / ``orchestrator.ckpt`` are Optional[None] by default —
-    # without this an empty shared block would be a no-op. Leaf-level
-    # conflicts (e.g. shared ``ckpt.interval`` vs ``trainer.ckpt.interval``)
-    # are already caught above; the bare block is exempt because
-    # ``[ckpt]`` + ``[trainer.ckpt] keep_last = 3`` is a legitimate
-    # "enable + customise per side" pattern. The ``isinstance(dict)`` check
-    # (not ``is not None``) is what makes CLI ``--no-wandb`` / ``--no-ckpt``
-    # work — those land as the *string* ``"None"`` until ``BaseConfig``'s
-    # parent-class validator converts it, which happens after this one.
-    for key in ("ckpt", "wandb", "file_monitor"):
-        if isinstance(get(key), dict):
-            fill(f"trainer.{key}", {})
-            fill(f"orchestrator.{key}", {})
+    # without this an empty shared block would be a no-op. Leaf-level conflicts
+    # (e.g. shared ``ckpt.interval`` vs ``trainer.ckpt.interval``) are already
+    # caught above; the bare block is exempt because ``[ckpt]`` +
+    # ``[trainer.ckpt] keep_last = 3`` is a legitimate "enable + customise per
+    # side" pattern. CLI ``--no-ckpt`` / ``--no-monitors.wandb`` land as the
+    # *string* ``"None"`` until ``BaseConfig``'s parent-class validator converts
+    # it, which happens after this one — the disable must propagate too, since
+    # the monitor sub-configs default to enabled.
+    presence_targets = {
+        "ckpt": ("trainer", "orchestrator"),
+        "monitors.wandb": ("trainer", "orchestrator"),
+        "monitors.file": ("trainer", "orchestrator"),
+        "monitors.prime": ("orchestrator",),
+    }
+    for key, targets in presence_targets.items():
+        value = get(key)
+        if isinstance(value, dict):
+            for target in targets:
+                fill(f"{target}.{key}", {})
+        elif value == "None":
+            for target in targets:
+                fill(f"{target}.{key}", "None")
 
     if conflicts:
         lines = [
@@ -194,140 +188,3 @@ def propagate_shared_fields(data: Any) -> Any:
         raise ValueError("\n".join(lines))
 
     return data
-
-
-def validate_shared_ckpt_config(
-    trainer: TrainerConfig,
-    orchestrator: OrchestratorConfig,
-) -> None:
-    if trainer.ckpt and not orchestrator.ckpt:
-        raise ValueError(
-            "Trainer checkpoint config is specified, but orchestrator checkpoint config is not. Please setup checkpointing on both for checkpointing to work properly."
-        )
-    if orchestrator.ckpt and not trainer.ckpt:
-        raise ValueError(
-            "Orchestrator checkpoint config is specified, but trainer checkpoint config is not. Please setup checkpointing on both for checkpointing to work properly."
-        )
-    if trainer.ckpt and orchestrator.ckpt and trainer.ckpt.interval != orchestrator.ckpt.interval:
-        raise ValueError(
-            f"Trainer checkpoint interval ({trainer.ckpt.interval}) and orchestrator checkpoint interval ({orchestrator.ckpt.interval}) are not the same. Please specify the same checkpoint interval for both."
-        )
-    if trainer.ckpt and orchestrator.ckpt and trainer.ckpt.resume_step != orchestrator.ckpt.resume_step:
-        raise ValueError(
-            f"Trainer checkpoint resume step ({trainer.ckpt.resume_step}) and orchestrator checkpoint resume step ({orchestrator.ckpt.resume_step}) are not the same. Please specify the same checkpoint resume step for both."
-        )
-
-
-def validate_shared_model_name(
-    trainer: TrainerConfig,
-    orchestrator: OrchestratorConfig,
-    inference: Optional[InferenceConfig] = None,
-) -> None:
-    # Orchestrator must match inference (it queries the inference server)
-    if inference is not None:
-        if inference.model.name != orchestrator.model.name:
-            raise ValueError(
-                f"Inference model name ({inference.model.name}) and orchestrator model name ({orchestrator.model.name}) are not the same. "
-                "The orchestrator queries the inference server and must use the same model name."
-            )
-        return
-
-    if trainer.model.name.startswith("Jackmin108/"):  # The TT MoE models will have a different name on the orchestrator
-        return
-    if trainer.model.name != orchestrator.model.name:
-        raise ValueError(
-            f"Trainer model name ({trainer.model.name}) and orchestrator model name ({orchestrator.model.name}) are not the same. Please specify the same model name for both."
-        )
-
-
-def validate_shared_output_dir(
-    trainer: TrainerConfig,
-    orchestrator: OrchestratorConfig,
-) -> None:
-    if trainer.output_dir != orchestrator.output_dir.parent:
-        raise ValueError(
-            f"Trainer outputs directory ({trainer.output_dir}) and orchestrator outputs directory parent ({orchestrator.output_dir.parent}) are not the same. Please specify the same outputs directory for both."
-        )
-
-
-def validate_shared_wandb_config(
-    trainer: TrainerConfig,
-    orchestrator: OrchestratorConfig,
-) -> None:
-    if trainer.wandb and not orchestrator.wandb:
-        raise ValueError(
-            "Trainer W&B config is specified, but orchestrator W&B config is not. "
-            "This means only trainer metrics will be logged. Please specify [orchestrator.wandb] to log orchestrator metrics as well, "
-            "or use [wandb] to configure both at once."
-        )
-    if orchestrator.wandb and not trainer.wandb:
-        raise ValueError(
-            "Orchestrator W&B config is specified, but trainer W&B config is not. "
-            "This means only orchestrator metrics will be logged. Please specify [trainer.wandb] to log trainer metrics as well, "
-            "or use [wandb] to configure both at once."
-        )
-    if trainer.wandb and orchestrator.wandb:
-        if trainer.wandb.project != orchestrator.wandb.project:
-            raise ValueError(
-                f"Trainer W&B project ({trainer.wandb.project}) and orchestrator W&B project ({orchestrator.wandb.project}) are not the same. Please specify the same W&B project for both."
-            )
-
-
-def validate_shared_max_steps(
-    trainer: TrainerConfig,
-    orchestrator: OrchestratorConfig,
-) -> None:
-    if trainer.max_steps != orchestrator.max_steps:
-        raise ValueError(
-            f"Trainer max steps ({trainer.max_steps}) and orchestrator max steps ({orchestrator.max_steps}) are not the same. Please specify the same max steps for both."
-        )
-
-
-def validate_shared_seq_len(
-    trainer: TrainerConfig,
-    orchestrator: OrchestratorConfig,
-) -> None:
-    if trainer.model.seq_len < orchestrator.seq_len:
-        raise ValueError(
-            f"Trainer model seq_len ({trainer.model.seq_len}) must be >= orchestrator seq_len ({orchestrator.seq_len}). "
-            f"The trainer needs to be able to handle sequences at least as long as those produced by the orchestrator."
-        )
-
-
-def validate_shared_tokenizer(
-    trainer: TrainerConfig,
-    orchestrator: OrchestratorConfig,
-    inference: Optional[InferenceConfig] = None,
-) -> None:
-    # Validate chat_template is consistent across all components.
-    # We only check chat_template (not name/trust_remote_code) because those
-    # are auto-derived from model names which may legitimately differ (e.g.
-    # when inference uses an FP8 quantized variant of the same model).
-    if trainer.tokenizer.chat_template != orchestrator.tokenizer.chat_template:
-        raise ValueError(
-            f"Trainer chat_template ({trainer.tokenizer.chat_template!r}) and orchestrator "
-            f"chat_template ({orchestrator.tokenizer.chat_template!r}) do not match. "
-            f"Use the shared [tokenizer] config to set chat_template for both."
-        )
-    if inference is not None:
-        if trainer.tokenizer.chat_template != inference.model.chat_template:
-            raise ValueError(
-                f"Inference chat_template ({inference.model.chat_template!r}) does not match "
-                f"the shared tokenizer chat_template ({trainer.tokenizer.chat_template!r}). "
-                f"Use the shared [tokenizer] config to set chat_template for all components."
-            )
-
-
-def validate_shared_weight_broadcast(
-    trainer: TrainerConfig,
-    orchestrator: OrchestratorConfig,
-    inference: Optional[InferenceConfig] = None,
-) -> None:
-    if trainer.weight_broadcast.type != orchestrator.weight_broadcast.type:
-        raise ValueError(
-            f"Trainer weight broadcast type ({trainer.weight_broadcast.type}) and orchestrator weight broadcast type ({orchestrator.weight_broadcast.type}) are not the same. Please specify the same weight broadcast type for both."
-        )
-    if inference is not None and inference.weight_broadcast.type != trainer.weight_broadcast.type:
-        raise ValueError(
-            f"Inference weight broadcast type ({inference.weight_broadcast.type}) and trainer/orchestrator weight broadcast type ({trainer.weight_broadcast.type}) are not the same. Please specify the same weight broadcast type for all components."
-        )

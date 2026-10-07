@@ -86,8 +86,14 @@ class PerfCounter:
                 return 756e12
             else:  # For H100 SXM and other variants
                 return 989e12
-        if "B200" in device_name:
+        if "GB200" in device_name or "GB300" in device_name:
+            # Grace Blackwell Superchips, dense BF16 per GPU: 2,500 TFLOPS
+            # https://www.nvidia.com/en-us/data-center/dgx-gb200/
+            # https://www.nvidia.com/en-us/data-center/dgx-gb300/
+            return 2.5e15
+        if "B200" in device_name or "B300" in device_name:
             # https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
+            # Checked after GB200/GB300 to avoid false match on "GB300"
             return 2.25e15  # This is half of the FLOPS reported in torchtitan
         # AMD Instinct GPUs
         if "MI300X" in device_name:
@@ -173,19 +179,27 @@ class PerfCounter:
         if hasattr(model_config, "text_config"):
             model_config = model_config.text_config
 
-        l, h, q, t = (  # noqa: E741
+        l, h, t = (  # noqa: E741
             model_config.num_hidden_layers,
             model_config.num_attention_heads,
-            model_config.hidden_size // model_config.num_attention_heads,
             seq_len,
         )
-        # Reasoning behind the factor of 12 for the self-attention part of the formula:
+        # Head dims as torchtitan's quadratic_attention_flops_per_token: the real head_dim (e.g. 128 for
+        # Qwen3-235B, whose hidden_size / num_attention_heads is 64), or the MLA qk / v head dims.
+        if hasattr(model_config, "qk_head_dim") and hasattr(model_config, "v_head_dim"):
+            qk_head_dim, v_head_dim = model_config.qk_head_dim, model_config.v_head_dim
+        else:
+            qk_head_dim = v_head_dim = (
+                getattr(model_config, "head_dim", None) or model_config.hidden_size // model_config.num_attention_heads
+            )
+        # Reasoning behind the factor of 6 for the self-attention part of the formula:
         # 1. each self-attention has 2 matmul in the forward and 4 in the backward (6)
+        #    (q @ K^T over qk_head_dim, then scores @ V over v_head_dim, per head and attended token)
         # 2. the flash attention does 1 more matmul recomputation in the backward
         #    but recomputation should not be counted in calculating MFU           (+0)
         # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
         # 4. we follow the convention and do not account for sparsity in causal attention
-        attention_flops = 12 * l * h * q * t
+        attention_flops = 6 * l * h * (qk_head_dim + v_head_dim) * t
 
         if has_lora_layers(self.model):
             # LoRA case:

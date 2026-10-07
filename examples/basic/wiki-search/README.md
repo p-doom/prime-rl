@@ -9,14 +9,14 @@ In this example, we demonstrate how to train `Qwen3-4B-Instruct-2507` to answer 
 - **LLM judges**: Uses an LLM judge to evaluate answer quality alongside tool execution metrics
 - **Online difficulty buffer**: Uses difficulty-based sampling to ensure rollouts have strictly non-zero advantages
 
-> This example runs on 8 GPUs (6 for inference, 2 for training).
+> This example runs on 8 GPUs (6 for inference, 2 for training). To run on 2 GPUs (1 inference, 1 trainer), add `--deployment.num-train-gpus 1 --deployment.num-infer-gpus 1 --orchestrator.batch-size 128` to the `rl` command.
 
 ## Setup
 
 The taskset is included through the Verifiers workspace. After syncing the repository, verify it with:
 
 ```bash
-uv run python -c "import wiki_search_v1"
+uv run python -c "import wiki_search"
 ```
 
 Set up the credentials for the configured reference judge:
@@ -25,10 +25,10 @@ Set up the credentials for the configured reference judge:
 export OPENAI_API_KEY=your_api_key_here
 ```
 
-Start the tmux session:
+We'll use two terminals: one for the inference server, one for everything else. To watch the run while it trains — metrics, resolved configs, rollout traces, and logs in one place — start the local dashboard and open http://localhost:7788:
 
 ```bash
-bash scripts/tmux.sh
+uv run dashboard
 ```
 
 ## Task
@@ -69,21 +69,15 @@ Key configuration highlights:
 Start the inference server:
 
 ```bash
-# In the `Inference` pane
-uv run inference --enable-lora --model.name Qwen/Qwen3-4B-Instruct-2507 --model.tool_call_parser hermes
+# Run this in the inference terminal
+uv run inference --vllm.enable-lora --vllm.model Qwen/Qwen3-4B-Instruct-2507 --vllm.tool-call-parser hermes
 ```
 
 Evaluate the base model:
 
 ```bash
-# In the `Trainer` pane
-uv run eval wiki-search-v1 --harness.id null \
-  -m Qwen/Qwen3-4B-Instruct-2507 \
-  --client.base-url http://localhost:8000/v1 \
-  -n 20 \
-  -r 3 \
-  --sampling.max-tokens 512 \
-  --no-push
+# Run this in the other terminal
+uv run eval @ examples/basic/wiki-search/eval.toml
 ```
 
 ## RL Training
@@ -91,10 +85,11 @@ uv run eval wiki-search-v1 --harness.id null \
 Train with the unified config file:
 
 ```bash
-# In the `Trainer` pane
+# Run this in the other terminal
 uv run rl @ examples/basic/wiki-search/rl.toml \
-  --wandb.project your-project-name \
-  --wandb.name your-run-name
+  --run.name rl \
+  --monitors.wandb.project your-project-name \
+  --monitors.wandb.name your-run-name
 ```
 
 The unified config file automatically configures:
@@ -102,30 +97,20 @@ The unified config file automatically configures:
 - **Orchestrator**: Rollout generation with tool calling enabled
 - **Inference**: vLLM server for Qwen3-4B-Instruct-2507 with tool parsing enabled
 
-This will write weight checkpoints in `outputs/weights/step_*`. Upload the final checkpoint to HuggingFace:
-
-```bash
-uv run hf upload <user>/Qwen3-4B-Instruct-WikiSearch-RL outputs/weights/step_500
-```
+This will write DCP checkpoints in `outputs/rl/checkpoints/step_*`.
 
 ## Evaluation
 
 Evaluate your trained model:
 
 ```bash
-# In the `Inference` pane
-uv run inference --enable-lora --model.name <user>/Qwen3-4B-Instruct-WikiSearch-RL --model.tool_call_parser hermes
+# Run this in the inference terminal
+uv run inference --vllm.enable-lora --vllm.model <user>/Qwen3-4B-Instruct-WikiSearch-RL --vllm.tool-call-parser hermes
 ```
 
 ```bash
-# In the `Trainer` pane
-uv run eval wiki-search-v1 --harness.id null \
-  -m <user>/Qwen3-4B-Instruct-WikiSearch-RL \
-  --client.base-url http://localhost:8000/v1 \
-  -n 20 \
-  -r 3 \
-  --sampling.max-tokens 512 \
-  --no-push
+# Run this in the other terminal
+uv run eval @ examples/basic/wiki-search/eval.toml -m <user>/Qwen3-4B-Instruct-WikiSearch-RL
 ```
 
 ## Taskset Configuration
@@ -135,7 +120,7 @@ The V1 taskset fixes the question bank and searchable corpus. You can replace it
 ```toml
 [[orchestrator.train.source]]
 name = "wiki-search"
-taskset = { id = "wiki-search-v1", task = { judges = [{ id = "reference", model = "openai/gpt-5.4-nano" }] } }
+taskset = { id = "wiki-search", task = { judges = [{ id = "reference", model = "openai/gpt-5.4-nano" }] } }
 harness = { id = "null" }
 runtime = { type = "subprocess" }
 ```

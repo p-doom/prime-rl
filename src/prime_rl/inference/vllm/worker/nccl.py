@@ -7,12 +7,8 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 
-from prime_rl.inference.vllm.worker.weight_transfer import (
-    load_weights_checkpoint_layerwise,
-    load_weights_kernel,
-    update_mla_absorbed_weights,
-)
-from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
+from prime_rl.inference.vllm.worker.weight_transfer import load_weights_checkpoint_layerwise
+from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable, iter_tensor_buckets
 
 # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
 if TYPE_CHECKING:
@@ -43,22 +39,24 @@ def receive_state_dict(communicator: PyNcclCommunicator) -> Generator[tuple[str,
 
     # Receive concatenated tensors per dtype and split them back
     for dtype, tensor_info_list in metadata.items():
-        # Receive concatenated tensor for this dtype
-        total_elements = sum(numel for _, _, numel in tensor_info_list)
-        concatenated = torch.empty(total_elements, dtype=dtype, device=communicator.device)
-        communicator.broadcast(concatenated, src=0)
+        for bucket in iter_tensor_buckets(tensor_info_list, dtype):
+            # Receive concatenated tensor for this dtype
+            total_elements = sum(numel for _, _, numel in bucket)
+            concatenated = torch.empty(total_elements, dtype=dtype, device=communicator.device)
+            if total_elements:
+                communicator.broadcast(concatenated, src=0)
 
-        # Split concatenated tensor back into individual tensors
-        offset = 0
-        for key, shape, numel in tensor_info_list:
-            tensor = concatenated[offset : offset + numel].view(shape).clone()
-            offset += numel
-            try:
-                yield key, tensor
-            finally:
-                del tensor
+            # Split concatenated tensor back into individual tensors
+            offset = 0
+            for key, shape, numel in bucket:
+                tensor = concatenated[offset : offset + numel].view(shape)
+                offset += numel
+                try:
+                    yield key, tensor
+                finally:
+                    del tensor
 
-        del concatenated
+            del concatenated
 
 
 class NCCLWeightBroadcastReceiver:
@@ -99,7 +97,6 @@ class NCCLWeightUpdateWorker(Worker):
         rank_offset: int,
         inference_world_size: int,
         timeout: int,
-        quantize_in_weight_transfer: bool = False,
         session_id: str = "default",
     ) -> None:
         """Initialize the NCCL broadcast receiver.
@@ -109,7 +106,6 @@ class NCCLWeightUpdateWorker(Worker):
             inference_world_size: Total number of inference GPUs across all servers.
         """
         del session_id
-        self.quantize_in_weight_transfer = quantize_in_weight_transfer
         # Use the worker's device index directly as the local rank.
         # The previous dp_group-based computation broke in vLLM v1 multiprocess
         # DP mode where each worker is a separate process with a singleton
@@ -145,11 +141,6 @@ class NCCLWeightUpdateWorker(Worker):
         assert isinstance(model, Module)
 
         state_iter = self.nccl_broadcast_receiver.receive_state_dict()
-        if self.quantize_in_weight_transfer:
-            load_weights_kernel(model, state_iter)
-            update_mla_absorbed_weights(model)
-            return
-
         load_weights_checkpoint_layerwise(
             model,
             state_iter,

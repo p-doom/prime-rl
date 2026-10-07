@@ -12,6 +12,7 @@ This page covers the inference configuration and the supported features/deployme
 - [P/D Disaggregation](#pd-disaggregation)
 - [Router](#router)
     - [Routing policies](#routing-policies)
+- [Adaptive Concurrency](#adaptive-concurrency)
 - [Advanced Configuration](#advanced-configuration)
     - [KV Cache Offload](#kv-cache-offload)
     - [Optimized P/D disaggregation deployment](#optimized-pd-disaggregation-deployment)
@@ -42,7 +43,7 @@ type = "single_node" # or "multi_node" or "disaggregated"
 To configure the inference server, you can use the `InferenceConfig` field. This is a config-field that allows you to set the inference server-specific knobs. Most of these are supported for all deployment shapes, with few exceptions. These exceptions are rejected on validation.
 
 ```toml
-[inference]
+[inference.vllm]
 model = "PrimeIntellect/INTELLECT-3"
 ...
 ```
@@ -63,20 +64,18 @@ The launcher starts a `vllm-router` on `inference.server.port` (default `8000`) 
 This deployment shape runs the inference server on a single node, if configured with NVLink enabled, it allows you more freedom in terms of parallelism configurations.
 
 ```toml
-[inference]
+[inference.vllm]
 enable_expert_parallel = true # defaults to False
-
-[inference.parallel]
-tp = 2
-dp = 4
+tensor_parallel_size = 2
+data_parallel_size = 4
 
 [inference.deployment]
 type = "single_node"
 ```
 
-We reccomend choosing your parallelism based on the expected throughput and latency requirements. High `dp` might create high latency, however it will also give you the highest throughput. This is a tradeoff you need to make based on your use case and required `orchestrator.max_inflight_requests`. Setting `tp` to a higher value will usually give you lower latency, but the inference server also will become saturated faster with lower number of requests.
+We reccomend choosing your parallelism based on the expected throughput and latency requirements. High `dp` might create high latency, however it will also give you the highest throughput. This is a tradeoff you need to make based on your use case and required concurrency (see [Adaptive Concurrency](#adaptive-concurrency)). Setting `tp` to a higher value will usually give you lower latency, but the inference server also will become saturated faster with lower number of requests.
 
-Another thing to consider, is the memory usage. You need to make sure that the model will fit into the available GPU memory. We will not go into the details on how to do this in this document. Related thing to consider, is the space for the KV cache. This will heavily affect the amount of requests your inference server can handle. You want to shard your model, either using `inference.enable_expert_parallel` or `inference.parallel.tp` to maximize the available GPU memory.
+Another thing to consider, is the memory usage. You need to make sure that the model will fit into the available GPU memory. We will not go into the details on how to do this in this document. Related thing to consider, is the space for the KV cache. This will heavily affect the amount of requests your inference server can handle. You want to shard your model, either using `inference.vllm.enable_expert_parallel` or `inference.vllm.tensor_parallel_size` to maximize the available GPU memory.
 
 You can also increase the available KV cache memory by enabling `inference.kv_cache_offload`. More details in the [Advanced Configuration](#advanced-configuration) section.
 
@@ -86,7 +85,7 @@ You can also increase the available KV cache memory by enabling `inference.kv_ca
 This deployment shape branches into 2 sub-shapes:
 
 - [Multi-replica](#multi-replica) - Runs the inference server on multiple nodes, but each node runs an independent vLLM replica. You can think of this as a for-loop over single-node deployments.
-- [Wide-EP](#wide-ep) - This option is gated behind `inference.enable_expert_parallel = true`. It allows you to run the inference server on multiple nodes, allowing you to use multi-node expert parallelism. This is a more advanced feature that is suitable for high-throughput, high-concurrency workloads.
+- [Wide-EP](#wide-ep) - This option is gated behind `inference.vllm.enable_expert_parallel = true`. It allows you to run the inference server on multiple nodes, allowing you to use multi-node expert parallelism. This is a more advanced feature that is suitable for high-throughput, high-concurrency workloads.
 
 ### Multi-replica
 
@@ -98,35 +97,31 @@ Parallelism configuration is the same as the single-node deployment. The shape i
 type = "multi_node"
 num_nodes = 2
 
-[inference]
+[inference.vllm]
 model = "PrimeIntellect/INTELLECT-3"
-
-[inference.parallel]
-tp = 2
-dp = 4
+tensor_parallel_size = 2
+data_parallel_size = 4
 ```
 
-This configuration will run 2 independent vLLM replicas, each with `tp=2` and `dp=4`. Routing is handled by a single global router running on the first inference node, fronting the per-rank endpoints of all replicas — either `vllm-router` (default) or the upstream `llm-d` EPP+Envoy, selected via the `[inference.router]` block. You can read more about the supported routing options in the [router](#router) section.
+This configuration will run 2 independent vLLM replicas, each with `tensor_parallel_size=2` and `data_parallel_size=4`. Routing is handled by a single global router running on the first inference node, fronting the per-rank endpoints of all replicas — either `vllm-router` (default) or the upstream `llm-d` EPP+Envoy, selected via the `[inference.router]` block. You can read more about the supported routing options in the [router](#router) section.
 
 ### Wide-EP
 
-For huge, 200B+ scale models, you might want to use multi-node expert parallelism to maximize the KV-cache space. This deployment shape is defined by setting `inference.deployment.type = "multi_node"` and `inference.enable_expert_parallel = true`.
+For huge, 200B+ scale models, you might want to use multi-node expert parallelism to maximize the KV-cache space. This deployment shape is defined by setting `inference.deployment.type = "multi_node"` and `inference.vllm.enable_expert_parallel = true`.
 
 ```toml
 [inference.deployment]
 type = "multi_node"
 num_nodes = 2
 
-[inference]
+[inference.vllm]
 model = "PrimeIntellect/INTELLECT-3"
 enable_expert_parallel = true
-
-[inference.parallel]
-tp = 2
-dp = 8
+tensor_parallel_size = 2
+data_parallel_size = 8
 ```
 
-This configuration will run 2 vLLM processes, each with `data_parallel_size_local = 4` and `tp = 2` and expert parallelism spanning 2 nodes. The requests are again routed to these processes via the `vllm-router`.
+This configuration will run 2 vLLM processes, each with `data_parallel_size_local = 4` and `tensor_parallel_size = 2` and expert parallelism spanning 2 nodes. The requests are again routed to these processes via the `vllm-router`.
 
 ## P/D Disaggregation
 
@@ -195,19 +190,25 @@ Both backends support the 2 most important things:
 - P/D disaggregation - handling the prefill and decode stages separately
 
 ### Routing policies
-The 2 policies you might want to configure are:
-- `consistent_hash` - this is the default policy that optimizes for KV cache re-use across turns - this works by hashing a request header to determine where to route the request to. You can configure what to hash by setting
-`orchestrator.model.client.extra_headers_from_state` to the header the `router` expects to be set.
+The policies you might want to configure are:
+- `sticky_least_loaded` - the default policy. A new `X-Session-ID` is assigned to the least-loaded replica, then every later turn in that rollout remains on the same replica for KV cache reuse. The orchestrator releases sessions when rollouts complete, fail, or are cancelled, including traces discarded during retries. Failed release requests are logged without disabling future cleanup.
 
-We set it to a sensible default, that works with all verifiers environments.
-
-```toml
-[orchestrator.model.client.extra_headers_from_state]
-X-Session-ID = "trajectory_id" # this is the default - each rollout has a unique trajectory_id and router expects X-Session-ID
-```
+- `consistent_hash` - hashes the `X-Session-ID` request header (sent per rollout by the verifiers clients) to pick a replica, preserving KV cache reuse without considering current load.
 
 - `round_robin` - this policy will round-robin the requests between the available replicas. This is useful if you want to balance the load between the replicas. This might give you better results if you don't have enough rollouts to make `consistent_hash` hashing saturated.
 
+
+## Adaptive Concurrency
+
+The orchestrator continuously sizes how many episodes run against the inference engines at once. A static cap cannot be right: too low starves the engines, too high crosses into KV thrash — the engines evict prefix cache, re-prefill the evicted work, and throughput collapses. The optimal value depends on the model, the deployment, and the workload's episode lengths, and it moves as training changes the policy.
+
+The controller's idea is to treat the engines as ground truth and probe, instead of modeling episode cost: while the engines show headroom, admit a little more; when they show pressure, back off. Three behaviors, in increasing severity:
+
+- **Grow**: while the engines look healthy and the current cap is fully used, raise it multiplicatively. Growth is clocked by the pipeline itself — the cap rises by a fixed factor each time the in-flight pool has turned over once — so a fast single-turn workload ramps in seconds while a slow agentic workload ramps at its own pace, with no tuning per workload.
+- **Trim**: episodes grow their context *while running*, so a pool that fit comfortably an hour ago can outgrow memory without a single new admission. When KV usage nears the ceiling, the controller first lowers the cap and lets completions drain the pool naturally (soft — no work lost); only if usage keeps climbing despite the closed gate does it also cancel the youngest episodes (hard — least work lost).
+- **Cut**: when the engines are demonstrably overloaded — requests being preempted, or piling up in the waiting queue — cut the pool hard, cancel the excess, and hold further cuts until the system settles.
+
+The cap starts from a safe bound derived from the engines (KV capacity divided by the maximum context length), or from `initial_inflight` when a good value is known, and always stays within `[min_inflight, max_inflight]`.
 
 ## Advanced Configuration
 
@@ -272,27 +273,46 @@ type = "disaggregated"
 These are role-specific and layer on top of [`env_vars`](configuration.md#environment-variables) shared by all inference processes regardless of role.
 
 ### Other vLLM features
-We support various other vLLM features. Some of those, such as `enable_dbo`, `enable_eplb` are exposed as a top-level config fields. For those that are not, you can configure them by setting `inference.vllm_extra` to the desired value.
+The `[inference.vllm]` section is a pass-through: every key is forwarded to the vLLM server under vLLM's own argument name, whether prime-rl types it or not. Anything `vllm serve` accepts can be set here.
 
 ```toml
-[inference.vllm_extra]
+[inference.vllm]
 headless = true
+max_num_seqs = 256
 ```
+
+On the CLI the same keys are available as `--inference.vllm.max-num-seqs 256` (or `--vllm.max-num-seqs 256` for the standalone inference entrypoint); dict-valued arguments take a JSON string, e.g. `--vllm.compilation-config '{"cudagraph_mode": "NONE"}'`.
 
 ### Router Replay
 
 Router replay works by capturing the expert routing decisions into a buffer. This buffer then gets sent to the trainer, which can use it instead of re-computing the routing. This lowers the trainer↔inference mismatch by an order of magnitude, resulting in more stable training.
 
-To enable router replay, you can set `inference.enable_return_routed_experts = true`.
+To enable router replay, you can set `inference.vllm.enable_return_routed_experts = true`. Capture runs on vLLM's V2 model runner (forced automatically). Router replay is not supported with disaggregated P/D: vLLM does not capture routed experts across NIXL KV transfer.
 
 ```toml
 [trainer]
-enable_router_replay = true # this will also auto-set the inference.enable_return_routed_experts = true
+enable_router_replay = true # this will also auto-set inference.vllm.enable_return_routed_experts = true
 
-[inference]
+[inference.vllm]
 enable_return_routed_experts = true
 ```
 
-This however is not free, it adds a significant overhead to the HTTP requests as this payload can grow quite large. We reccomend sizing up the env-server pool (`orchestrator.*.source.serve.pool`) to allow for more parallelization on the verifiers side.
+This however is not free, it adds a significant overhead to the HTTP requests as this payload can grow quite large. We reccomend sizing up the env server pool (`orchestrator.*.source.serve.pool`) to allow for more parallelization on the verifiers side.
 
 Currently this feature is also not supported with CPU KV cache offload, which can have negative impact on the inference throughput.
+
+### Sampling Replay
+
+Truncated sampling (`top_p < 1`, `top_k`) renormalizes the sampling distribution over a sampling mask of surviving token ids. The rollout logprobs reflect that (`logprobs_mode = "processed_logprobs"`), so the trainer must renormalize over the same mask — otherwise every importance ratio is biased and training collapses (DeepSeek V3.2's "Keep Sampling Mask", [arXiv:2512.02556](https://arxiv.org/abs/2512.02556) §3.1; Cognition's [SWE-1.7 post](https://cognition.com/blog/swe-1-7)). prime-rl handles this automatically: vLLM records the sampling mask at sampling time (`--return-sampling-mask`, native since vLLM 0.28) and the trainer renormalizes its logprobs over it.
+
+```toml
+[orchestrator.train.sampling]
+top_p = 0.95
+top_k = 512   # optional, defaults to 512 under truncation (bounds each sampling mask)
+```
+
+That's all — there are no replay flags. Truncated train sampling makes the inference server return sampling masks (`inference.enable_return_sampling_mask`, auto-enabled), and the trainer replays them. Train-sampling `top_k` above 512 is rejected: the trainer pads each micro batch to its largest sampling mask, so the bound caps trainer memory. Configs that would break under renormalized logprobs are rejected: `opd`/`opsd` and truncation knobs smuggled via `extra_body`. Frozen-source envs are exempt.
+
+Capture runs on vLLM's V2 model runner (forced automatically) and is engine-wide. It can run together with router replay. While sampling capture is on, vLLM rejects any request with `temperature <= 0` or without an effective `top_k > 0` — eval sampling against the training server must set `top_k` (the model's generation config often supplies one) and a non-zero temperature.
+
+When launching the inference server standalone, set `inference.enable_return_sampling_mask = true` yourself; clients must sample with `0 < top_k <= 512`.

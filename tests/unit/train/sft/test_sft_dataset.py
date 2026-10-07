@@ -1,10 +1,11 @@
+import json
 from collections import Counter
 
 import pytest
 import torch
 from datasets import Dataset, interleave_datasets
 from renderers import create_renderer
-from renderers.base import MultiModalData, PlaceholderRange, RenderedTokens, RenderedTrainingSample
+from renderers.base import MultiModalData, PlaceholderRange, RenderedTrainingSample
 from transformers import AutoTokenizer
 
 import prime_rl.trainer.sft.data as sft_data
@@ -19,30 +20,11 @@ def _sample_token_ids(value: str) -> list[int]:
     return [ord(char) + 2 for char in value]
 
 
-class _DummyRenderer:
-    def render(self, messages, **kwargs):
-        content_ids = _sample_token_ids(messages[-1]["content"])
-        token_ids = [_BOS_TOKEN_ID, *content_ids, _STOP_TOKEN_ID]
-        return RenderedTokens(
-            token_ids=token_ids,
-            message_indices=[-1, *([len(messages) - 1] * (len(content_ids) + 1))],
-            sampled_mask=[False, *([True] * (len(content_ids) + 1))],
-        )
-
-    def get_stop_token_ids(self):
-        return [_STOP_TOKEN_ID]
-
-
 @pytest.fixture(scope="module")
 def build_dummy_dataset():
     return lambda letter, num_examples: Dataset.from_list(
         [{"messages": [{"role": "assistant", "content": f"{letter}{i}"}]} for i in range(num_examples)]
     )
-
-
-@pytest.fixture
-def dummy_renderer():
-    return _DummyRenderer()
 
 
 @pytest.mark.parametrize(
@@ -70,7 +52,7 @@ def test_drop_null_fields_preserves_tool_call_arguments(arguments):
 def test_init_sft_dataset(build_dummy_dataset, dummy_renderer):
     """Tests basic initialization."""
     dataset = build_dummy_dataset("a", 1)
-    sft_dataset = SFTDataset(dataset, dummy_renderer)
+    sft_dataset = SFTDataset(dataset, lambda _: dummy_renderer)
     assert sft_dataset is not None
 
 
@@ -78,7 +60,7 @@ def test_raise_error_if_no_prompt_and_completion(build_dummy_dataset):
     """Tests that an error is raised if no supported SFT message fields are provided."""
     dataset = Dataset.from_list([{"text": "a0"}])
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-    sft_dataset = SFTDataset(dataset, create_renderer(tokenizer))
+    sft_dataset = SFTDataset(dataset, lambda _: create_renderer(tokenizer))
     with pytest.raises(ValueError):
         next(iter(sft_dataset))
 
@@ -89,7 +71,7 @@ def test_sft_first_exhausted(build_dummy_dataset, dummy_renderer, max_epochs: in
     b = build_dummy_dataset("b", 2)
     ds = [a, b]
     dataset = interleave_datasets(ds, stopping_strategy="first_exhausted")
-    dataset = SFTDataset(dataset, dummy_renderer, shuffle=False, max_epochs=max_epochs)
+    dataset = SFTDataset(dataset, lambda _: dummy_renderer, shuffle=False, max_epochs=max_epochs)
     num_samples = 0
     sampling_order = []
     for x in dataset:
@@ -105,7 +87,7 @@ def test_sft_all_exhausted(build_dummy_dataset, dummy_renderer, max_epochs: int)
     b = build_dummy_dataset("b", 2)
     ds = [a, b]
     dataset = interleave_datasets(ds, stopping_strategy="all_exhausted")
-    dataset = SFTDataset(dataset, dummy_renderer, shuffle=False, max_epochs=max_epochs)
+    dataset = SFTDataset(dataset, lambda _: dummy_renderer, shuffle=False, max_epochs=max_epochs)
     num_samples = 0
     sampling_order = []
     for x in dataset:
@@ -139,7 +121,7 @@ def test_sft_all_exhausted_with_probs(build_dummy_dataset, dummy_renderer, probs
     b = build_dummy_dataset("b", int(10e3))
     ds = [a, b]
     dataset = interleave_datasets(ds, stopping_strategy="all_exhausted", probabilities=probs)
-    dataset = SFTDataset(dataset, dummy_renderer, shuffle=False, max_epochs=1)
+    dataset = SFTDataset(dataset, lambda _: dummy_renderer, shuffle=False, max_epochs=1)
     num_samples = 0
     sampling_freq = []
     for x in dataset:
@@ -159,7 +141,7 @@ def test_sft_all_exhausted_with_probs(build_dummy_dataset, dummy_renderer, probs
 def test_sft_dataset_state(build_dummy_dataset, dummy_renderer):
     """Tests the state of the dataset within and across epochs."""
     dataset = build_dummy_dataset("", 4)
-    dataset = SFTDataset(dataset, dummy_renderer, shuffle=False, max_epochs=2)
+    dataset = SFTDataset(dataset, lambda _: dummy_renderer, shuffle=False, max_epochs=2)
     dataiter = iter(dataset)
 
     # Initial state
@@ -185,7 +167,7 @@ def test_sft_dataset_state_resume(build_dummy_dataset, dummy_renderer):
     """Tests resuming the dataset from checkpoint in between epochs."""
     dataset = SFTDataset(
         build_dummy_dataset("", 4),
-        dummy_renderer,
+        lambda _: dummy_renderer,
         shuffle=False,
         max_epochs=2,
     )
@@ -205,7 +187,7 @@ def test_sft_dataset_state_resume(build_dummy_dataset, dummy_renderer):
     del dataset
     dataset = SFTDataset(
         build_dummy_dataset("", 4),
-        dummy_renderer,
+        lambda _: dummy_renderer,
         shuffle=False,
         max_epochs=2,
     )
@@ -223,7 +205,7 @@ def test_sft_dataset_state_resume(build_dummy_dataset, dummy_renderer):
     del dataset
     dataset = SFTDataset(
         build_dummy_dataset("", 4),
-        dummy_renderer,
+        lambda _: dummy_renderer,
         shuffle=False,
         max_epochs=2,
     )
@@ -254,7 +236,7 @@ def test_multiturn_loss_mask():
         ]
     )
     tokenizer = AutoTokenizer.from_pretrained("PrimeIntellect/Qwen3-0.6B")  # Properly handles multi-turn think
-    dataset = SFTDataset(dataset, create_renderer(tokenizer), max_examples=1)
+    dataset = SFTDataset(dataset, lambda _: create_renderer(tokenizer), max_examples=1)
     sample = next(iter(dataset))
     print_sample(sample["input_ids"], sample["loss_mask"], tokenizer)
 
@@ -317,7 +299,7 @@ def test_multiturn_loss_mask_with_tools():
 
     dataset = Dataset.from_list([tool_example])
     tokenizer = AutoTokenizer.from_pretrained("PrimeIntellect/Qwen3-0.6B")  # Properly handles multi-turn think
-    dataset = SFTDataset(dataset, create_renderer(tokenizer), max_examples=1)
+    dataset = SFTDataset(dataset, lambda _: create_renderer(tokenizer), max_examples=1)
     sample = next(iter(dataset))
     print_sample(sample["input_ids"], sample["loss_mask"], tokenizer)
 
@@ -344,12 +326,12 @@ def test_messages_rows_are_equivalent_to_empty_prompt_completion():
     tokenizer = AutoTokenizer.from_pretrained("PrimeIntellect/Qwen3-0.6B")
     messages_dataset = SFTDataset(
         Dataset.from_list([{"messages": messages}]),
-        create_renderer(tokenizer),
+        lambda _: create_renderer(tokenizer),
         max_examples=1,
     )
     split_dataset = SFTDataset(
         Dataset.from_list([{"prompt": [], "completion": messages}]),
-        create_renderer(tokenizer),
+        lambda _: create_renderer(tokenizer),
         max_examples=1,
     )
 
@@ -370,12 +352,12 @@ def test_messages_take_precedence_over_prompt_and_completion():
 
     messages_dataset = SFTDataset(
         Dataset.from_list([row]),
-        create_renderer(tokenizer),
+        lambda _: create_renderer(tokenizer),
         max_examples=1,
     )
     expected_dataset = SFTDataset(
         Dataset.from_list([{"prompt": [], "completion": row["messages"]}]),
-        create_renderer(tokenizer),
+        lambda _: create_renderer(tokenizer),
         max_examples=1,
     )
 
@@ -391,19 +373,19 @@ def test_null_messages_falls_back_to_prompt_and_completion():
 
     mixed_row_dataset = SFTDataset(
         Dataset.from_list([{"messages": None, "prompt": prompt, "completion": completion}]),
-        create_renderer(tokenizer),
+        lambda _: create_renderer(tokenizer),
         max_examples=1,
     )
     expected_dataset = SFTDataset(
         Dataset.from_list([{"prompt": prompt, "completion": completion}]),
-        create_renderer(tokenizer),
+        lambda _: create_renderer(tokenizer),
         max_examples=1,
     )
 
     assert next(iter(mixed_row_dataset)) == next(iter(expected_dataset))
 
 
-def test_vlm_truncation_does_not_append_trainable_eos(monkeypatch):
+def test_vlm_truncation_does_not_append_trainable_eos(monkeypatch, dummy_renderer):
     mm = MultiModalData(
         mm_placeholders={"image": [PlaceholderRange(offset=1, length=1)]},
         mm_items={"image": [{"pixel_values": torch.ones(1, 1), "image_grid_thw": torch.tensor([[1, 1, 1]])}]},
@@ -418,7 +400,7 @@ def test_vlm_truncation_does_not_append_trainable_eos(monkeypatch):
         )
 
     monkeypatch.setattr(sft_data, "build_training_sample", fake_build_training_sample)
-    dataset = SFTDataset(Dataset.from_list([]), _DummyRenderer(), seq_len=2, multimodal=True)
+    dataset = SFTDataset(Dataset.from_list([]), lambda _: dummy_renderer, seq_len=2, multimodal=True)
 
     assert dataset._process({"messages": [{"role": "assistant", "content": "ignored"}]}) is None
 
@@ -504,3 +486,111 @@ def test_cat_dataset_packs_text_and_multimodal_samples_together():
     assert text_pack["seq_lens"] == [5]
     assert text_pack["mm_kwargs"] is None
     assert text_pack["mm_token_type_ids"] is None
+
+
+CUSTOM_RENDERER_SOURCE = """
+from typing import Literal
+
+from renderers.base import RenderedTokens
+from renderers.configs import BaseRendererConfig
+
+
+class EffortRendererConfig(BaseRendererConfig):
+    name: Literal["effort"] = "effort"
+    _template_fields = frozenset({"reasoning_effort"})
+
+    reasoning_effort: Literal["low", "high"] = "low"
+
+
+class EffortRenderer:
+    config_class = EffortRendererConfig
+
+    def __init__(self, tokenizer, config):
+        self.config = config
+
+    def render(self, messages, **kwargs):
+        return RenderedTokens(token_ids=[0, 1], message_indices=[-1, 0], sampled_mask=[False, True])
+
+    def get_stop_token_ids(self):
+        return [1]
+"""
+
+
+@pytest.fixture
+def custom_renderer_config(tmp_path):
+    from renderers import CustomRendererConfig
+
+    path = tmp_path / "effort_renderer.py"
+    path.write_text(CUSTOM_RENDERER_SOURCE)
+    return CustomRendererConfig(import_path=f"{path}:EffortRenderer")
+
+
+def test_renderer_resolver_applies_renderer_columns_to_custom_renderer(custom_renderer_config):
+    resolver = sft_data.RendererResolver(tokenizer=None, config=custom_renderer_config)
+
+    default = resolver({"messages": [], "reasoning_effort": None})
+    high = resolver({"messages": [], "reasoning_effort": "high"})
+
+    assert default.config.reasoning_effort == "low"
+    assert high.config.reasoning_effort == "high"
+    assert resolver({"messages": [], "reasoning_effort": "high"}) is high
+    with pytest.raises(ValueError):
+        resolver({"messages": [], "reasoning_effort": "medium"})
+
+
+def test_renderer_resolver_reads_mapped_columns(custom_renderer_config):
+    resolver = sft_data.RendererResolver(
+        tokenizer=None, config=custom_renderer_config, columns={"reasoning_effort": "effort"}
+    )
+
+    assert resolver({"effort": "high", "reasoning_effort": "low"}).config.reasoning_effort == "high"
+    assert resolver({"reasoning_effort": "high"}).config.reasoning_effort == "low"
+
+
+def test_renderer_resolver_rejects_renderer_columns_without_the_field():
+    from renderers import PrimeQwen3RendererConfig
+
+    resolver = sft_data.RendererResolver(tokenizer=None, config=PrimeQwen3RendererConfig())
+
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        resolver({"messages": [], "reasoning_effort": "high"})
+
+
+def test_sft_dataset_reads_mapped_message_columns(dummy_renderer):
+    from prime_rl.configs.sft import SFTColumnsConfig
+
+    dataset = Dataset.from_list([{"conversation": [{"role": "assistant", "content": "a0"}]}])
+
+    sample = next(
+        iter(SFTDataset(dataset, lambda _: dummy_renderer, columns=SFTColumnsConfig(messages="conversation")))
+    )
+    assert sample["input_ids"] == [_BOS_TOKEN_ID, *_sample_token_ids("a0")]
+    assert sample["target_ids"] == [*_sample_token_ids("a0"), _STOP_TOKEN_ID]
+
+    with pytest.raises(ValueError, match="'messages' column"):
+        next(iter(SFTDataset(dataset, lambda _: dummy_renderer)))
+    with pytest.raises(ValueError, match="data.columns.prompt"):
+        SFTDataset(dataset, lambda _: dummy_renderer, columns=SFTColumnsConfig(prompt="question"))
+
+
+def test_sft_dataset_passes_tools_through_from_the_mapped_column(dummy_renderer):
+    from prime_rl.configs.sft import SFTColumnsConfig
+
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+    dataset = Dataset.from_list(
+        [{"messages": [{"role": "assistant", "content": "a0"}], "schemas": json.dumps(tools), "tools": []}]
+    )
+    seen: list = []
+
+    class RecordingRenderer:
+        def render(self, messages, tools=None, **kwargs):
+            seen.append(tools)
+            return dummy_renderer.render(messages)
+
+        def get_stop_token_ids(self):
+            return dummy_renderer.get_stop_token_ids()
+
+    next(iter(SFTDataset(dataset, lambda _: RecordingRenderer())))
+    next(iter(SFTDataset(dataset, lambda _: RecordingRenderer(), columns=SFTColumnsConfig(tools="schemas"))))
+
+    assert seen == [[], tools]

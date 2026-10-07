@@ -1,7 +1,7 @@
 # Start the frozen reference server first (on a separate GPU):
 #   CUDA_VISIBLE_DEVICES=1 uv run inference \
-#     --model.name PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL \
-#     --server.port 8001 --gpu-memory-utilization 0.5 --model.enforce-eager
+#     --vllm.model PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL \
+#     --server.port 8001 --vllm.gpu-memory-utilization 0.5 --vllm.enforce-eager
 # Then:
 #   uv run rl @ configs/debug/algo/sft_distill_lora.toml
 
@@ -11,21 +11,23 @@ seq_len = 2048
 [model]
 name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
 
-[wandb]
+[monitors.wandb]
 project = "algorithms-debug"
 name = "debug-sft-lora"
 
 [orchestrator]
 batch_size = 128
+
+[orchestrator.train]
 group_size = 4
 
-[orchestrator.algo]
+[orchestrator.train.algo]
 type = "sft"
 
 # sft's teacher IS the model it samples from.
-[orchestrator.algo.sampling.source]
+[orchestrator.train.algo.sampling.source]
 name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL"
-base_url = ["http://localhost:8001/v1"]
+base_url = "http://localhost:8001/v1"
 
 # The student's renderer tokenizes the teacher's messages into the student's
 # token space (backfill). Use `prime-qwen3` — it matches this PrimeIntellect
@@ -40,34 +42,24 @@ max_completion_tokens = 128
 
 [[orchestrator.train.source]]
 name = "reverse-text"
-
-[orchestrator.train.source.env.taskset]
-id = "reverse-text-v1"
-
-[orchestrator.train.source.env.agent.harness]
-id = "null"
-
-[orchestrator.train.source.env.agent.runtime]
-type = "subprocess"
+env.taskset.id = "reverse-text"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [orchestrator.eval]
 interval = 1
-num_examples = 128
+
+[orchestrator.eval.select]
+limit = 128
 
 [orchestrator.eval.sampling]
 max_completion_tokens = 128
 
 [[orchestrator.eval.source]]
 name = "reverse-text"
-
-[orchestrator.eval.source.env.taskset]
-id = "reverse-text-v1"
-
-[orchestrator.eval.source.env.agent.harness]
-id = "null"
-
-[orchestrator.eval.source.env.agent.runtime]
-type = "subprocess"
+env.taskset.id = "reverse-text"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [trainer.optim]
 lr = 1e-4
@@ -75,10 +67,9 @@ lr = 1e-4
 [trainer.model.lora]
 rank = 8
 
-[trainer.ckpt.weights]
-save_adapter_separately = true
-
 [ckpt]
 
 [inference]
+
+[inference.vllm]
 gpu_memory_utilization = 0.5
