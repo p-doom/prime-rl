@@ -396,6 +396,25 @@ def test_resolved_json_roundtrips_explicit_none(tmp_path):
     assert reloaded == config
 
 
+def test_single_node_rl_json_roundtrips(tmp_path):
+    """A single-node SLURM job re-parses the rl.json its launcher wrote."""
+    from prime_rl.entrypoints.rl import RL_CONFIG, write_config
+
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {},
+            "inference": {"vllm": {"data_parallel_size": 2}},
+            "deployment": {"type": "single_node", "gpus_per_node": 4, "num_train_gpus": 2, "num_infer_gpus": 2},
+        }
+    )
+    assert config.weight_broadcast.type == "nccl"
+
+    write_config(config, tmp_path)
+    reloaded = cli(RLConfig, args=["@", str(tmp_path / RL_CONFIG)])
+    assert reloaded == config
+
+
 @pytest.mark.parametrize(
     "config_class,source_args,expected_url,expected_key",
     [
